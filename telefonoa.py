@@ -44,15 +44,28 @@ class ReceiverStatus(Thread):
             else:
                 self.receiver_down = True
 
+
+class Dialer(Thread):
+    def __init__(self):
+        Thread.__init__(self)
+        self.finish = False
+
+    def run(self):
+        while not self.finish():
+            pass
+
+
 class Telephone:
     def __init__(self, num_pin, receiver_pin):
         self.receiver_pin = receiver_pin
         self.number_q = Queue.Queue()
         self.rotary_dial = RotaryDial(num_pin, self.number_q)
         self.receiver_status = ReceiverStatus(receiver_pin)
+        self.dialer = Dialer()
 
         self.rotary_dial.start()
         self.receiver_status.start()
+        self.dialer.start()
 
     def receiver_status_show(self):
         print(self.receiver_status.receiver_down)
@@ -63,6 +76,7 @@ class Telephone:
     def close(self):
         self.rotary_dial.finish = True
         self.receiver_status.finish = True
+        self.dialer.finisg = True
 
 
 if __name__ == '__main__':
