@@ -4,21 +4,16 @@ import time
 from threading import Thread
 
 
-def count(val):
-    global c
-    c = c + 1
-    print("Pulse:", c)
-
-
 class RotaryDial(Thread):
     def __init__(self, ns_pin):
         Thread.__init__(self)
         self.pin = ns_pin
         self.value = 0
         self.timeout_time = 500
+        self.finish = False
 
     def run(self):
-        while True:
+        while not self.finish:
             c = GPIO.wait_for_edge(self.pin, GPIO.RISING, bouncetime=90, timeout=self.timeout_time)
             if c is None:
                 if self.value > 0:
@@ -41,5 +36,5 @@ if __name__ == '__main__':
     r = RotaryDial(NS_PIN)
 
     r.start()
-    while True:
-        pass
+    time.sleep(10)
+    r.finish = True
