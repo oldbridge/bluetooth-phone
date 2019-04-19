@@ -3,6 +3,8 @@ import datetime
 import time
 from threading import Thread
 import queue as Queue
+import pyaudio
+import numpy as np
 
 
 class RotaryDial(Thread):
@@ -63,12 +65,25 @@ class Telephone:
         self.receiver_status = ReceiverStatus(receiver_pin)
         self.dialer = Dialer()
 
+        # Initialize audio parameters
+        self.audio = pyaudio.PyAudio()
+        self.fs = 44100
+        tone_f = 440
+        duration = 1
+        self.tone_samples = (np.sin(2 * np.pi * np.arange(self.fs * duration) * tone_f / self.fs)).astype(np.float32)
+        self.stream = self.audio.open(format=pyaudio.paFloat32,
+                                      channels=1,
+                                      rate=self.fs,
+                                      output_device_index=1,
+                                      output=True)
+
+        # Start all threads
         self.rotary_dial.start()
         self.receiver_status.start()
         self.dialer.start()
 
     def receiver_status_show(self):
-        print(self.receiver_status.receiver_down)
+        self.stream.write(self.tone_samples)
 
     def dial_tone(self):
         pass
@@ -76,15 +91,13 @@ class Telephone:
     def close(self):
         self.rotary_dial.finish = True
         self.receiver_status.finish = True
-        self.dialer.finisg = True
+        self.dialer.finish = True
 
 
 if __name__ == '__main__':
     HOERER_PIN = 13
     NS_PIN = 19
     GPIO.setmode(GPIO.BCM)
-
-
 
     t = Telephone(NS_PIN, HOERER_PIN)
     for i in range(10):
