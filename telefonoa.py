@@ -29,21 +29,40 @@ class RotaryDial(Thread):
                 self.value += 1
 
 
+class ReceiverStatus(Thread):
+    def __init__(self, receiver_pin):
+        Thread.__init__(self)
+        self.receiver_pin = receiver_pin
+        GPIO.setup(self.receiver_pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+        self.receiver_down = False
+        self.finish = False
+
+    def run(self):
+        while not self.finish:
+            if GPIO.input(self.receiver_pin) == GPIO.LOW:
+                self.receiver_down = False
+            else:
+                self.receiver_down = True
+
 class Telephone:
     def __init__(self, num_pin, receiver_pin):
         self.receiver_pin = receiver_pin
         self.number_q = Queue.Queue()
         self.rotary_dial = RotaryDial(num_pin, self.number_q)
-        self.rotary_dial.start()
+        self.receiver_status = ReceiverStatus(receiver_pin)
 
-    def receiver_status(self):
-        if GPIO.input(self.receiver_pin) == GPIO.LOW:
-            print("Up")
-        else:
-            print("Down")
+        self.rotary_dial.start()
+        self.receiver_status.start()
+
+    def receiver_status_show(self):
+        print(self.receiver_status.receiver_down)
+
+    def dial_tone(self):
+        pass
 
     def close(self):
         self.rotary_dial.finish = True
+        self.receiver_status.finish = True
 
 
 if __name__ == '__main__':
@@ -51,10 +70,10 @@ if __name__ == '__main__':
     NS_PIN = 19
     GPIO.setmode(GPIO.BCM)
 
-    GPIO.setup(HOERER_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+
 
     t = Telephone(NS_PIN, HOERER_PIN)
     for i in range(10):
-        t.receiver_status()
+        t.receiver_status_show()
         time.sleep(1)
     t.close()
