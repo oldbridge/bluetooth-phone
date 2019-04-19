@@ -2,12 +2,15 @@ import RPi.GPIO as GPIO
 import datetime
 import time
 from threading import Thread
+import queue as Queue
 
 
 class RotaryDial(Thread):
-    def __init__(self, ns_pin):
+    def __init__(self, ns_pin, number_queue):
         Thread.__init__(self)
         self.pin = ns_pin
+        self.number_q = number_queue
+        GPIO.setup(self.pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
         self.value = 0
         self.timeout_time = 500
         self.finish = False
@@ -18,11 +21,29 @@ class RotaryDial(Thread):
             if c is None:
                 if self.value > 0:
                     print("Detected: %d" % self.value)
+                    self.number_q.put(self.value)
                     self.value = 0
                 else:
                     self.value = 0
             else:
                 self.value += 1
+
+
+class Telephone:
+    def __init__(self, num_pin, receiver_pin):
+        self.receiver_pin = receiver_pin
+        self.number_q = Queue.Queue()
+        self.rotary_dial = RotaryDial(num_pin, self.number_q)
+        self.rotary_dial.start()
+
+    def receiver_status(self):
+        if GPIO.input(self.receiver_pin) == GPIO.LOW:
+            print("Up")
+        else:
+            print("Down")
+
+    def close(self):
+        self.rotary_dial.finish = True
 
 
 if __name__ == '__main__':
@@ -31,10 +52,9 @@ if __name__ == '__main__':
     GPIO.setmode(GPIO.BCM)
 
     GPIO.setup(HOERER_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-    GPIO.setup(NS_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
 
-    r = RotaryDial(NS_PIN)
-
-    r.start()
-    time.sleep(10)
-    r.finish = True
+    t = Telephone(NS_PIN, HOERER_PIN)
+    for i in range(10):
+        t.receiver_status()
+        time.sleep(1)
+    t.close()
