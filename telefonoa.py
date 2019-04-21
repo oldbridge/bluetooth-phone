@@ -4,8 +4,9 @@ import time
 from threading import Thread
 from threading import Event
 import queue as Queue
-import pyaudio
+import alsaaudio
 import numpy as np
+import struct
 
 
 class RotaryDial(Thread):
@@ -56,28 +57,38 @@ class Dialer(Thread):
         Thread.__init__(self)
 
         self.fs = 8000
-        tone_f = 440
-        points = 8000
-        self.duration = points / self.fs
-        times = np.linspace(0, self.duration, points, endpoint=False)
-        self.tone_samples = np.array((np.sin(times * tone_f * 2 * np.pi) + 1.0) * 127.5, dtype=np.int8).tostring()
+        self.channels = 1
+        self.framesize = 2
+        tone_f = 444.44  # Careful with the frequency, sampling_rate / f must be an integer (avoid cutting)
         self.tone = Event()
         self.finish = False
 
-    def run(self):
-        while True:  # Keep the thread alive forever
-            while not self.tone.is_set():  # Wait UNTIL the tone flag is set
-                pass
-            audio = pyaudio.PyAudio()
-            stream = audio.open(format=audio.get_format_from_width(1),
-                                     channels=1,
-                                     rate=self.fs,
-                                     output=True)
-            while self.tone.is_set():  # Play the tone WHILE the tone flas is set
-                stream.write(self.tone_samples)
+        self.setDaemon(True)
+        self.device = alsaaudio.PCM()
+        self.device.setchannels(1)
+        self.device.setformat(alsaaudio.PCM_FORMAT_S16_LE)
+        self.device.setrate(self.fs)
 
-            stream.close()
-            audio.terminate()
+        # the buffersize we approximately want
+        target_size = int(self.fs * self.channels * 0.125)
+
+        # the length of a full sine wave at the frequency
+        cycle_size = int(self.fs / tone_f)
+
+        # number of full cycles we can fit into target_size
+        factor = int(target_size / cycle_size)
+
+        size = max(int(cycle_size * factor), 1)
+
+        sine = [int(32767 * np.sin(2 * np.pi * tone_f * i / self.fs)) for i in range(size)]
+
+        self.tone_buffer = struct.pack('%dh' % size, *sine)
+        #self.device.setperiodsize(int(len(self.tone_buffer) / self.framesize))
+
+    def run(self):
+        while not self.finish:  # Keep the thread alive forever
+            while self.tone.is_set():  # Play the tone WHILE the tone flas is set
+                self.device.write(self.tone_buffer)
 
 
 class Telephone(object):
