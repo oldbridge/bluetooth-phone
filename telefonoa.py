@@ -59,7 +59,10 @@ class Dialer(Thread):
         self.fs = 8000
         self.channels = 1
         self.framesize = 2
-        tone_f = 444.44  # Careful with the frequency, sampling_rate / f must be an integer (avoid cutting)
+        tone_f = 425  # European dial tone frequency
+
+        tone_f = float(self.fs) / int(self.fs / tone_f)  # Careful with the frequency, sampling_rate / f must be an integer (avoid cutting)
+
         self.tone = Event()
         self.finish = False
 
@@ -73,8 +76,8 @@ class Dialer(Thread):
         target_size = int(self.fs * self.channels * 0.125)
 
         # the length of a full sine wave at the frequency
-        cycle_size = int(self.fs / tone_f)
-
+        cycle_size = self.fs / tone_f
+        print(cycle_size)
         # number of full cycles we can fit into target_size
         factor = int(target_size / cycle_size)
 
