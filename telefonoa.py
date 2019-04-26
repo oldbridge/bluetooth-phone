@@ -2,6 +2,8 @@ import RPi.GPIO as GPIO
 import datetime
 import dbus
 import dbus.mainloop.glib
+import wave
+import alsaaudio
 from gi.repository import GLib
 
 import time
@@ -109,6 +111,8 @@ class PhoneManager(object):
 
 
 class Telephone(object):
+    CHUNK = 1024
+
     def __init__(self, num_pin, receiver_pin):
         GPIO.setmode(GPIO.BCM)
         self.receiver_pin = receiver_pin
@@ -116,15 +120,65 @@ class Telephone(object):
         self.phone_manager = PhoneManager()
         self.rotary_dial = RotaryDial(num_pin, self.number_q)
         self.receiver_status = ReceiverStatus(receiver_pin, self.phone_manager)
+        self.stop_audio = False
+        self.playing_audio = False
         self.finish = False
 
         # Start all threads
         self.rotary_dial.start()
 
+    def start_file(self, filename, loop=False):
+        self._thread = Thread(target=self.__play_file, args=[filename, loop])
+        self._thread.start()
+        self.playing_audio = True
+
+    def __play_file(self, filename, loop):
+        self.stop_audio = False
+        if not loop:
+            # open a wav format music
+            f = wave.open(filename, "rb")
+            # open stream
+            stream = alsaaudio.PCM(type=alsaaudio.PCM_PLAYBACK,
+                                   mode=alsaaudio.PCM_NORMAL)
+            stream.setchannels(f.getnchannels())
+            stream.setrate(f.getframerate())
+            # read data
+            data = f.readframes(self.CHUNK)
+
+            # play stream
+            while data and not self.stop_audio:
+                stream.write(data)
+                data = f.readframes(self.CHUNK)
+        else:
+            # open a wav format music
+            f = wave.open(filename, "rb")
+            # open stream
+            stream = alsaaudio.PCM(type=alsaaudio.PCM_PLAYBACK,
+                                   mode=alsaaudio.PCM_NORMAL)
+            stream.setchannels(2)
+            stream.setrate(f.getframerate())
+            # read data
+            data = f.readframes(self.CHUNK)
+
+            # play stream
+            while loop and not self.stop_audio:
+                f.rewind()
+                data = f.readframes(self.CHUNK)
+                while data and not self.stop_audio:
+                    stream.write(data)
+                    data = f.readframes(self.CHUNK)
+
+
+    def stop_file(self):
+        self.stop_audio = True
+        self.playing_audio = False
+
     def dialing_handler(self):
         number = ''
         while not self.finish:
-            if not self.receiver_status.receiver_down:
+            if not self.receiver_status.receiver_down:  # Handling of the dialing when the receiver is lifted
+                    if not self.playing_audio:
+                        self.start_file("dial_tone.wav", loop=True)
                     try:
                         c = self.number_q.get(timeout=3)
                         number += str(c)
@@ -136,13 +190,18 @@ class Telephone(object):
                             number = ''
                         pass
 
-            else:
+            else:  # Handling of the dialing when the receiver is down
+                if self.playing_audio:
+                    self.stop_file()
                 try:
                     c = self.number_q.get(timeout=3)
                     print("Selected %d" % c)
+                    if c == 1:
+                        self.start_file("ahots.wav")
+                        #time.sleep(15)
+                        #self.stop_file()
                 except Queue.Empty:
                     pass
-
 
     def close(self):
         self.rotary_dial.finish = True
