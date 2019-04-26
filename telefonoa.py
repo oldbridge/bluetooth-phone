@@ -61,48 +61,6 @@ class ReceiverStatus():
             self.receiver_down = True
 
 
-class Dialer(Thread):
-    def __init__(self):
-        Thread.__init__(self)
-
-        self.fs = 8000
-        self.channels = 1
-        self.framesize = 2
-        tone_f = 425  # European dial tone frequency
-
-        tone_f = float(self.fs) / int(self.fs / tone_f)  # Careful with the frequency, sampling_rate / f must be an integer (avoid cutting)
-
-        self.tone = Event()
-        self.finish = False
-
-        self.setDaemon(True)
-        #self.device = alsaaudio.PCM()
-        self.device.setchannels(1)
-        self.device.setformat(alsaaudio.PCM_FORMAT_S16_LE)
-        self.device.setrate(self.fs)
-
-        # the buffersize we approximately want
-        target_size = int(self.fs * self.channels * 0.125)
-
-        # the length of a full sine wave at the frequency
-        cycle_size = self.fs / tone_f
-        print(cycle_size)
-        # number of full cycles we can fit into target_size
-        factor = int(target_size / cycle_size)
-
-        size = max(int(cycle_size * factor), 1)
-
-        sine = [int(32767 * np.sin(2 * np.pi * tone_f * i / self.fs)) for i in range(size)]
-
-        self.tone_buffer = struct.pack('%dh' % size, *sine)
-        #self.device.setperiodsize(int(len(self.tone_buffer) / self.framesize))
-
-    def run(self):
-        while not self.finish:  # Keep the thread alive forever
-            while self.tone.is_set():  # Play the tone WHILE the tone flas is set
-                self.device.write(self.tone_buffer)
-
-
 class PhoneManager(object):
     def __init__(self):
         dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
@@ -158,12 +116,10 @@ class Telephone(object):
         self.phone_manager = PhoneManager()
         self.rotary_dial = RotaryDial(num_pin, self.number_q)
         self.receiver_status = ReceiverStatus(receiver_pin, self.phone_manager)
-        #self.dialer = Dialer()
         self.finish = False
 
         # Start all threads
         self.rotary_dial.start()
-        #self.dialer.start()
 
     def dialing_handler(self):
         number = ''
@@ -181,20 +137,17 @@ class Telephone(object):
                         pass
 
             else:
-                pass
-                    #if self.phone_manager.call_in_progress:
-                     #   print("Hanging down call!")
-                        #self.phone_manager.call_in_progress = False
-                        #self.phone_manager.end_call()
-                    #print("Lift to dial")
+                try:
+                    c = self.number_q.get(timeout=3)
+                    print("Selected %d" % c)
+                except Queue.Empty:
+                    pass
 
 
     def close(self):
         self.rotary_dial.finish = True
         self.receiver_status.finish = True
         self.phone_manager.loop.quit()
-        GPIO.cleanup()
-        #self.dialer.finish = True
 
 
 if __name__ == '__main__':
