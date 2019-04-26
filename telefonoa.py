@@ -41,28 +41,6 @@ class RotaryDial(Thread):
                     self.number_q.put(self.value)
                 self.value = 0
 
-
-class ReceiverStatus():
-    def __init__(self, receiver_pin, phone_manager):
-        self.receiver_pin = receiver_pin
-        self.phone_manager = phone_manager
-        GPIO.setup(self.receiver_pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-        if GPIO.input(self.receiver_pin) is GPIO.HIGH:
-            self.receiver_down = True
-        else:
-            self.receiver_down = False
-        self.finish = False
-        GPIO.add_event_detect(self.receiver_pin, GPIO.BOTH, callback=self.receiver_changed, bouncetime=90)
-
-    def receiver_changed(self, pin_num):
-        if self.receiver_down:
-            self.receiver_down = False
-        else:
-            if self.phone_manager.call_in_progress:
-                self.phone_manager.end_call()
-            self.receiver_down = True
-
-
 class PhoneManager(object):
     def __init__(self):
         dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
@@ -119,13 +97,30 @@ class Telephone(object):
         self.number_q = Queue.Queue()
         self.phone_manager = PhoneManager()
         self.rotary_dial = RotaryDial(num_pin, self.number_q)
-        self.receiver_status = ReceiverStatus(receiver_pin, self.phone_manager)
         self.stop_audio = False
         self.playing_audio = False
         self.finish = False
 
+        # Receiver relevant functions
+        GPIO.setup(self.receiver_pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+        if GPIO.input(self.receiver_pin) is GPIO.HIGH:
+            self.receiver_down = True
+        else:
+            self.receiver_down = False
+        GPIO.add_event_detect(self.receiver_pin, GPIO.BOTH, callback=self.receiver_changed, bouncetime=90)
+
         # Start all threads
         self.rotary_dial.start()
+
+    def receiver_changed(self, pin_num):
+        if self.receiver_down:
+            self.receiver_down = False
+            self.start_file("dial_tone.wav", loop=True)
+        else:
+            if self.phone_manager.call_in_progress:
+                self.phone_manager.end_call()
+            self.receiver_down = True
+            self.stop_file()
 
     def start_file(self, filename, loop=False):
         self._thread = Thread(target=self.__play_file, args=[filename, loop])
@@ -168,7 +163,6 @@ class Telephone(object):
                     stream.write(data)
                     data = f.readframes(self.CHUNK)
 
-
     def stop_file(self):
         self.stop_audio = True
         self.playing_audio = False
@@ -176,16 +170,14 @@ class Telephone(object):
     def dialing_handler(self):
         number = ''
         while not self.finish:
-            if not self.receiver_status.receiver_down:  # Handling of the dialing when the receiver is lifted
-                    if not self.playing_audio:
-                        self.start_file("dial_tone.wav", loop=True)
+            if not self.receiver_down:  # Handling of the dialing when the receiver is lifted
                     try:
-                        c = self.number_q.get(timeout=3)
+                        c = self.number_q.get(timeout=5)
                         number += str(c)
-                        print(number)
                     except Queue.Empty:
                         if number is not '':
                             print("Dialing: %s" % number)
+                            self.stop_file()
                             self.phone_manager.call(number)
                             number = ''
                         pass
@@ -194,18 +186,15 @@ class Telephone(object):
                 if self.playing_audio:
                     self.stop_file()
                 try:
-                    c = self.number_q.get(timeout=3)
+                    c = self.number_q.get(timeout=5)
                     print("Selected %d" % c)
                     if c == 1:
                         self.start_file("ahots.wav")
-                        #time.sleep(15)
-                        #self.stop_file()
                 except Queue.Empty:
                     pass
 
     def close(self):
         self.rotary_dial.finish = True
-        self.receiver_status.finish = True
         self.phone_manager.loop.quit()
 
 
