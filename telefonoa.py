@@ -189,19 +189,21 @@ class Telephone(object):
                     c = self.number_q.get(timeout=5)
                     print("Selected %d" % c)
                     if c == 1:
-                        self.start_file("ahots.wav")
+                        print("Shotcut action 1 triggering")
+                    elif c == 2:
+                        print("Shotcut action 2 triggering")
                 except Queue.Empty:
                     pass
 
     def close(self):
         self.rotary_dial.finish = True
         self.phone_manager.loop.quit()
+        GPIO.cleanup()
 
 
 if __name__ == '__main__':
     HOERER_PIN = 13
     NS_PIN = 19
-
 
     t = Telephone(NS_PIN, HOERER_PIN)
     try:
