@@ -1,3 +1,9 @@
+
+# Copyright 2019 by Xabier Zubizarreta.
+# All rights reserved.
+# This file is released under the "MIT License Agreement".
+# More information on this license can be read under https://opensource.org/licenses/MIT
+
 import RPi.GPIO as GPIO
 import datetime
 import dbus
@@ -15,6 +21,9 @@ import struct
 
 
 class RotaryDial(Thread):
+    """
+    Thread class reading the dialed values and putting them into a thread queue
+    """
     def __init__(self, ns_pin, number_queue):
         Thread.__init__(self)
         self.pin = ns_pin
@@ -26,6 +35,10 @@ class RotaryDial(Thread):
         GPIO.add_event_detect(ns_pin, GPIO.FALLING, callback=self.__increment, bouncetime=90)
 
     def __increment(self, pin_num):
+        """
+        Increment function trigered each time a falling pulse is detected.
+        :param pin_num: GPIO pin triggering the event (Can only be self.ns_pin here)
+        """
         self.value += 1
 
     def run(self):
@@ -41,8 +54,12 @@ class RotaryDial(Thread):
                     self.number_q.put(self.value)
                 self.value = 0
 
+
 class PhoneManager(object):
     def __init__(self):
+        """
+        The PhoneManager class manages the calls and the communication with the ofono service.
+        """
         dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
         bus = dbus.SystemBus()
         manager = dbus.Interface(bus.get_object('org.ofono', '/'), 'org.ofono.Manager')
@@ -59,6 +76,9 @@ class PhoneManager(object):
         print("Initialized")
 
     def _setup_dbus_loop(self):
+        """
+        Sets up the D-Bus signals.
+        """
         dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
         self.loop = GLib.MainLoop()
         self._thread = Thread(target=self.loop.run)
@@ -71,17 +91,34 @@ class PhoneManager(object):
                                              dbus_interface='org.ofono.VoiceCallManager')
 
     def set_call_in_progress(self, object, properties):
+        """
+        Event triggered when a call is initiated.
+        :param object: The address of the call object from ofono
+        :param properties: Properties of the call
+        :return:
+        """
         print("Call in progress!")
         self.call_in_progress = True
 
     def set_call_ended(self, object):
+        """
+        Event triggered when a call is ended
+        :param object: The address of the call object from ofono (just as reference, cannot be fetched anymore)
+        :return:
+        """
         print("Call ended!")
         self.call_in_progress = False
 
     def end_call(self):
+        """
+        Method to finalize the current (all, actually) call
+        """
         self.voice_call_manager.HangupAll()
 
     def call(self, number, hide_id='default'):
+        """
+        Method to place call. It handles incorrectly dialed numbers thanks to ofono exceptions
+        """
         try:
             self.voice_call_manager.Dial(str(number), hide_id)
         except Exception as e:
@@ -89,6 +126,9 @@ class PhoneManager(object):
 
 
 class Telephone(object):
+    """
+    Main Telephone class containing everything required for the Bluetooth telephone to work.
+    """
     CHUNK = 1024
 
     def __init__(self, num_pin, receiver_pin):
@@ -113,6 +153,11 @@ class Telephone(object):
         self.rotary_dial.start()
 
     def receiver_changed(self, pin_num):
+        """
+        Event triggered when the receiver is hung of lifted.
+        :param pin_num: GPIO pin triggering the event (Can only be self.receiver_pin here)
+        :return:
+        """
         if self.receiver_down:
             self.receiver_down = False
             self.start_file("dial_tone.wav", loop=True)
@@ -123,11 +168,21 @@ class Telephone(object):
             self.stop_file()
 
     def start_file(self, filename, loop=False):
+        """
+        Start a thread reproducing an audio file
+        :param filename: The name of the file to play
+        :param loop: If the file should be played as a loop (like in the case of the dial tone)
+        """
         self._thread = Thread(target=self.__play_file, args=[filename, loop])
         self._thread.start()
         self.playing_audio = True
 
     def __play_file(self, filename, loop):
+        """
+        Private function handling the wav file replay
+        :param filename: The name of the file to play
+        :param loop: If the file should be played as a loop (like in the case of the dial tone)
+        """
         self.stop_audio = False
         if not loop:
             # open a wav format music
@@ -150,7 +205,7 @@ class Telephone(object):
             # open stream
             stream = alsaaudio.PCM(type=alsaaudio.PCM_PLAYBACK,
                                    mode=alsaaudio.PCM_NORMAL)
-            stream.setchannels(2)
+            stream.setchannels(f.getnchannels())
             stream.setrate(f.getframerate())
             # read data
             data = f.readframes(self.CHUNK)
@@ -168,19 +223,23 @@ class Telephone(object):
         self.playing_audio = False
 
     def dialing_handler(self):
+        """
+        Main function of the telephone that handles the dialing if the receiver is lifted or hooked.
+        :return:
+        """
         number = ''
         while not self.finish:
             if not self.receiver_down:  # Handling of the dialing when the receiver is lifted
-                    try:
-                        c = self.number_q.get(timeout=5)
-                        number += str(c)
-                    except Queue.Empty:
-                        if number is not '':
-                            print("Dialing: %s" % number)
-                            self.stop_file()
-                            self.phone_manager.call(number)
-                            number = ''
-                        pass
+                try:
+                    c = self.number_q.get(timeout=5)
+                    number += str(c)
+                except Queue.Empty:
+                    if number is not '':
+                        print("Dialing: %s" % number)
+                        self.stop_file()
+                        self.phone_manager.call(number)
+                        number = ''
+                    pass
 
             else:  # Handling of the dialing when the receiver is down
                 if self.playing_audio:
@@ -189,9 +248,9 @@ class Telephone(object):
                     c = self.number_q.get(timeout=5)
                     print("Selected %d" % c)
                     if c == 1:
-                        print("Shotcut action 1 triggering")
+                        print("Shortcut action 1 triggering")
                     elif c == 2:
-                        print("Shotcut action 2 triggering")
+                        print("Shortcut action 2 triggering")
                 except Queue.Empty:
                     pass
 
