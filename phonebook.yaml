@@ -1,0 +1,5 @@
+# Add up to 8 numbers corresponding for number 1-8 when hooked
+- name: Number 1
+  number: 123456789
+- name: Number 2
+  number: 987654321

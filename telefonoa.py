@@ -9,6 +9,7 @@ import dbus
 import dbus.mainloop.glib
 import wave
 import alsaaudio
+import yaml
 from gi.repository import GLib
 
 import time
@@ -203,6 +204,12 @@ class Telephone(object):
         self.playing_audio = False
         self.finish = False
 
+        # Load fast_dial numbers
+        with open("phonebook.yaml", 'r') as stream:
+            self.phonebook = yaml.safe_load(stream)
+
+        print(self.phonebook)
+
         # Receiver relevant functions
         GPIO.setup(self.receiver_pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
         if GPIO.input(self.receiver_pin) is GPIO.HIGH:
@@ -313,16 +320,17 @@ class Telephone(object):
                 try:
                     c = self.number_q.get(timeout=5)
                     print("Selected %d" % c)
-                    if c == 1:
-                        number = 555555
-                        print("Shortcut action 1: Automatic dial")
-                        time.sleep(4)
-                        self.phone_manager.call(number)
-                    elif c == 9:
+                    if c == 9:
                         print("Turning system off")
                         self.start_file("/home/pi/telefonoa/turnoff.wav")
                         time.sleep(6)
                         call("sudo shutdown -h now", shell=True)
+                    elif c <= len(self.phonebook):
+                        print("Shortcut action %d: Automatic dial" % c)
+                        number = self.phonebook[c - 1]['number']
+                        print(number)
+                        time.sleep(4)
+                        self.phone_manager.call(number)
                 except Queue.Empty:
                     pass
 
