@@ -16,4 +16,5 @@ numpy
 
 For detailed instructions regarding setup please visit the <a href="https://hackaday.io/project/165208-an-old-rotary-phone-as-bluetooth-set" target="_blank">**hackaday.io page**</a> of the project.
 
+Clone everything to the directory ``/home/pi/telefonoa`` (currently needed because the notification audios use absolute paths)
 Run the file ``telefonoa.py`` with ``python3``
