@@ -1,4 +1,3 @@
-
 # Copyright 2019 by Xabier Zubizarreta.
 # All rights reserved.
 # This file is released under the "MIT License Agreement".
@@ -20,10 +19,12 @@ import numpy as np
 import struct
 from subprocess import call
 
+
 class RotaryDial(Thread):
     """
     Thread class reading the dialed values and putting them into a thread queue
     """
+
     def __init__(self, ns_pin, number_queue):
         Thread.__init__(self)
         self.pin = ns_pin
@@ -57,6 +58,7 @@ class RotaryDial(Thread):
 
 class PhoneManager(object):
     CHUNK = 1024
+
     def __init__(self):
         """
         The PhoneManager class manages the calls and the communication with the ofono service.
