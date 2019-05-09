@@ -18,7 +18,7 @@ from threading import Event
 import queue as Queue
 import numpy as np
 import struct
-
+from subprocess import call
 
 class RotaryDial(Thread):
     """
@@ -56,6 +56,7 @@ class RotaryDial(Thread):
 
 
 class PhoneManager(object):
+    CHUNK = 1024
     def __init__(self):
         """
         The PhoneManager class manages the calls and the communication with the ofono service.
@@ -121,8 +122,67 @@ class PhoneManager(object):
         """
         try:
             self.voice_call_manager.Dial(str(number), hide_id)
-        except Exception as e:
-            print("Cannot place the call, check format!")
+        except dbus.exceptions.DBusException as e:
+            name = e.get_dbus_name()
+            if name == 'org.freedesktop.DBus.Error.UnknownMethod':
+                print("Ofono not running")
+                self.start_file("/home/pi/telefonoa/not_connected.wav")
+            elif name == 'org.ofono.Error.InvalidFormat':
+                print("Invalid dialed number format!")
+                self.start_file("/home/pi/telefonoa/format_incorrect.wav")
+            else:
+                print(name)
+
+    def start_file(self, filename, loop=False):
+        """
+        Start a thread reproducing an audio file
+        :param filename: The name of the file to play
+        :param loop: If the file should be played as a loop (like in the case of the dial tone)
+        """
+        self._thread = Thread(target=self.__play_file, args=[filename, loop])
+        self._thread.start()
+        self.playing_audio = True
+
+    def __play_file(self, filename, loop):
+        """
+        Private function handling the wav file replay
+        :param filename: The name of the file to play
+        :param loop: If the file should be played as a loop (like in the case of the dial tone)
+        """
+        self.stop_audio = False
+        if not loop:
+            # open a wav format music
+            f = wave.open(filename, "rb")
+            # open stream
+            stream = alsaaudio.PCM(type=alsaaudio.PCM_PLAYBACK,
+                                   mode=alsaaudio.PCM_NORMAL)
+            stream.setchannels(f.getnchannels())
+            stream.setrate(f.getframerate())
+            # read data
+            data = f.readframes(self.CHUNK)
+
+            # play stream
+            while data and not self.stop_audio:
+                stream.write(data)
+                data = f.readframes(self.CHUNK)
+        else:
+            # open a wav format music
+            f = wave.open(filename, "rb")
+            # open stream
+            stream = alsaaudio.PCM(type=alsaaudio.PCM_PLAYBACK,
+                                   mode=alsaaudio.PCM_NORMAL)
+            stream.setchannels(f.getnchannels())
+            stream.setrate(f.getframerate())
+            # read data
+            data = f.readframes(self.CHUNK)
+
+            # play stream
+            while loop and not self.stop_audio:
+                f.rewind()
+                data = f.readframes(self.CHUNK)
+                while data and not self.stop_audio:
+                    stream.write(data)
+                    data = f.readframes(self.CHUNK)
 
 
 class Telephone(object):
@@ -144,13 +204,17 @@ class Telephone(object):
         # Receiver relevant functions
         GPIO.setup(self.receiver_pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
         if GPIO.input(self.receiver_pin) is GPIO.HIGH:
-            self.receiver_down = True
-        else:
             self.receiver_down = False
-        GPIO.add_event_detect(self.receiver_pin, GPIO.BOTH, callback=self.receiver_changed, bouncetime=90)
+        else:
+            self.receiver_down = True
+        self.receiver_changed(self.receiver_pin)
+        GPIO.add_event_detect(self.receiver_pin, GPIO.BOTH, callback=self.receiver_changed, bouncetime=10)
 
         # Start all threads
         self.rotary_dial.start()
+
+        # Anounce ready
+        self.start_file("/home/pi/telefonoa/ready.wav")
 
     def receiver_changed(self, pin_num):
         """
@@ -160,7 +224,7 @@ class Telephone(object):
         """
         if self.receiver_down:
             self.receiver_down = False
-            self.start_file("dial_tone.wav", loop=True)
+            self.start_file("/home/pi/telefonoa/dial_tone.wav", loop=True)
         else:
             if self.phone_manager.call_in_progress:
                 self.phone_manager.end_call()
@@ -248,9 +312,15 @@ class Telephone(object):
                     c = self.number_q.get(timeout=5)
                     print("Selected %d" % c)
                     if c == 1:
-                        print("Shortcut action 1 triggering")
-                    elif c == 2:
-                        print("Shortcut action 2 triggering")
+                        number = 555555
+                        print("Shortcut action 1: Automatic dial")
+                        time.sleep(4)
+                        self.phone_manager.call(number)
+                    elif c == 9:
+                        print("Turning system off")
+                        self.start_file("/home/pi/telefonoa/turnoff.wav")
+                        time.sleep(6)
+                        call("sudo shutdown -h now", shell=True)
                 except Queue.Empty:
                     pass
 
