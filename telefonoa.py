@@ -212,7 +212,7 @@ class AudioPlayer(object):
             stream.setformat(alsaaudio.PCM_FORMAT_S16_LE)
 
             on_frames = max(1, int(sample_rate * (on_ms / 1000.0)))
-            off_frames = max(1, int(sample_rate * (off_ms / 1000.0)))
+            off_frames = max(0, int(sample_rate * (off_ms / 1000.0)))
 
             amplitude = int(32767 * 0.3)
             phase_step = (2.0 * math.pi * frequency_hz) / sample_rate
@@ -222,13 +222,14 @@ class AudioPlayer(object):
                 sample = int(amplitude * math.sin(phase_step * i))
                 on_buffer.extend(struct.pack('<h', sample))
 
-            off_buffer = b'\x00\x00' * off_frames
+            off_buffer = b'\x00\x00' * off_frames if off_frames > 0 else b''
 
             while not stop_event.is_set():
                 stream.write(on_buffer)
                 if stop_event.is_set():
                     break
-                stream.write(off_buffer)
+                if off_buffer:
+                    stream.write(off_buffer)
         except Exception as exc:
             print("Tone playback failed: %s" % exc)
         finally:
@@ -613,7 +614,7 @@ class Telephone(object):
             ))
             self.start_busy_tone()
             return
-        self.start_file(self.asset_dir / "dial_tone.wav", loop=True)
+        self.start_dial_tone()
 
     def receiver_changed(self, pin_num):
         """
@@ -646,6 +647,10 @@ class Telephone(object):
     def start_busy_tone(self):
         # Besetztton cadence: 450 Hz, 125 ms ON / 375 ms OFF.
         self.audio_player.play_tone_pattern(frequency_hz=450.0, on_ms=125, off_ms=375)
+
+    def start_dial_tone(self):
+        # Dial tone: continuous 450 Hz.
+        self.audio_player.play_tone_pattern(frequency_hz=450.0, on_ms=100, off_ms=0)
 
     def stop_file(self):
         self.audio_player.stop()
