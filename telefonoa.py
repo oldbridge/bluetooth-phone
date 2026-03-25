@@ -178,9 +178,9 @@ class AudioPlayer(object):
                 stream = alsaaudio.PCM(
                     type=alsaaudio.PCM_PLAYBACK,
                     mode=alsaaudio.PCM_NORMAL,
+                    channels=wav_file.getnchannels(),
+                    rate=wav_file.getframerate(),
                 )
-                stream.setchannels(wav_file.getnchannels())
-                stream.setrate(wav_file.getframerate())
 
                 while not stop_event.is_set():
                     data = wav_file.readframes(self.chunk_size)
@@ -206,10 +206,10 @@ class AudioPlayer(object):
             stream = alsaaudio.PCM(
                 type=alsaaudio.PCM_PLAYBACK,
                 mode=alsaaudio.PCM_NORMAL,
+                channels=1,
+                rate=sample_rate,
+                format=alsaaudio.PCM_FORMAT_S16_LE,
             )
-            stream.setchannels(1)
-            stream.setrate(sample_rate)
-            stream.setformat(alsaaudio.PCM_FORMAT_S16_LE)
 
             on_frames = max(1, int(sample_rate * (on_ms / 1000.0)))
             off_frames = max(0, int(sample_rate * (off_ms / 1000.0)))
@@ -242,6 +242,92 @@ class AudioPlayer(object):
 
     def close(self):
         self.stop()
+
+
+class UplinkBridge(object):
+    """Capture USB mic and stream directly to BlueALSA SCO from Python."""
+
+    def __init__(self, bt_device, capture_device='plughw:Device,0', sample_rate=8000, channels=1, period_frames=120):
+        self.bt_device = bt_device
+        self.capture_device = capture_device
+        self.playback_device = "bluealsa:DEV=%s,PROFILE=sco" % bt_device
+        self.sample_rate = sample_rate
+        self.channels = channels
+        self.period_frames = period_frames
+        self._stop_event = Event()
+        self._thread = None
+        self._lock = Lock()
+
+    @property
+    def is_running(self):
+        with self._lock:
+            return self._thread is not None and self._thread.is_alive()
+
+    def start(self):
+        with self._lock:
+            if self._thread is not None and self._thread.is_alive():
+                return
+            self._stop_event.clear()
+            self._thread = Thread(target=self._run, daemon=True)
+            thread = self._thread
+        print("[UPLINK] Starting Python ALSA bridge")
+        thread.start()
+
+    def stop(self):
+        with self._lock:
+            thread = self._thread
+            self._thread = None
+            self._stop_event.set()
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=1)
+        print("[UPLINK] Stopped Python ALSA bridge")
+
+    def _create_pcm(self, pcm_type, device):
+        pcm = alsaaudio.PCM(type=pcm_type, mode=alsaaudio.PCM_NORMAL, device=device)
+        pcm.setchannels(self.channels)
+        pcm.setrate(self.sample_rate)
+        pcm.setformat(alsaaudio.PCM_FORMAT_S16_LE)
+        pcm.setperiodsize(self.period_frames)
+        return pcm
+
+    def _wait_for_playback_ready(self):
+        # The BlueALSA PCM can exist before audio transfer starts. Probe until writes succeed.
+        silence = b'\x00\x00' * (self.period_frames * self.channels)
+        while not self._stop_event.is_set():
+            playback = None
+            try:
+                playback = self._create_pcm(alsaaudio.PCM_PLAYBACK, self.playback_device)
+                playback.write(silence)
+                print("[UPLINK] BlueALSA playback ready")
+                return playback
+            except alsaaudio.ALSAAudioError:
+                if playback is not None:
+                    del playback
+                time.sleep(0.2)
+        return None
+
+    def _run(self):
+        while not self._stop_event.is_set():
+            playback = self._wait_for_playback_ready()
+            if playback is None:
+                return
+
+            capture = None
+            try:
+                capture = self._create_pcm(alsaaudio.PCM_CAPTURE, self.capture_device)
+                while not self._stop_event.is_set():
+                    frames, data = capture.read()
+                    if frames <= 0 or not data:
+                        continue
+                    playback.write(data)
+            except alsaaudio.ALSAAudioError as exc:
+                print("[UPLINK] ALSA stream reset (%s), reconnecting..." % exc)
+                time.sleep(0.2)
+            finally:
+                if capture is not None:
+                    del capture
+                if playback is not None:
+                    del playback
 
 
 class PhoneManager(object):
@@ -496,6 +582,7 @@ class Telephone(object):
         GPIO.setup(self.ringer_pin, GPIO.OUT, initial=GPIO.HIGH)
         self.number_q = queue.Queue()
         self.audio_player = AudioPlayer()
+        self.uplink_bridge = UplinkBridge(bt_device='40:D1:60:4F:C2:15', capture_device='plughw:Device,0')
         self.phone_manager = PhoneManager(self.audio_player, self.asset_dir)
         self._ring_stop_event = Event()
         self._ring_lock = Lock()
@@ -596,12 +683,14 @@ class Telephone(object):
     def _apply_receiver_state(self):
         print("[HOOK] Applying state: receiver_%s" % ('down' if self.receiver_down else 'up'))
         if self.receiver_down:
+            self.uplink_bridge.stop()
             self._clear_manual_dial_state()
             self._stop_ringing()
             if self.phone_manager.call_in_progress or self.phone_manager.incoming_call:
                 self.phone_manager.end_call()
             self.stop_file()
             return
+        self.uplink_bridge.start()
         self._stop_ringing()
         if self.phone_manager.incoming_call:
             self.phone_manager.answer_call()
@@ -739,6 +828,7 @@ class Telephone(object):
 
     def close(self):
         self.finish = True
+        self.uplink_bridge.stop()
         self._stop_ringing()
         self._set_ringer(False)
         self.rotary_dial.stop()
