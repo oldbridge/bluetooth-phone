@@ -32,6 +32,49 @@ In practice, this usually means installing:
 - ALSA userspace and Python binding (`pyalsaaudio`)
 - `oFono` running and exposing `org.ofono` on the system bus
 
+## Quick start (Raspberry Pi OS)
+
+From the project directory (`bluetooth-phone/`):
+
+```bash
+sudo apt update
+sudo apt install -y python3-dbus python3-yaml python3-rpi.gpio python3-dev libasound2-dev build-essential ofono
+python3 -m pip install --upgrade pip
+python3 -m pip install pyalsaaudio
+```
+
+Then run:
+
+```bash
+python3 telefonoa.py
+```
+
+## Small oFono configuration
+
+Minimal setup to let this script access calls through D-Bus:
+
+1. Enable and start the service:
+
+```bash
+sudo systemctl enable --now ofono
+```
+
+2. Add your runtime user to the `ofono` group (required for `GetModems` access):
+
+```bash
+sudo usermod -aG ofono $USER
+```
+
+3. Re-login (or reboot) so new groups are applied.
+
+4. Confirm `oFono` sees a modem:
+
+```bash
+sudo dbus-send --system --print-reply --dest=org.ofono / org.ofono.Manager.GetModems
+```
+
+If the returned array is empty, `oFono` is running but no modem is ready yet.
+
 ## What the script does
 
 `telefonoa.py` is the main runtime service. It contains:
@@ -101,10 +144,6 @@ Default GPIO assignment in the script:
 - Ringer output pin is fixed in code to GPIO `18`
 
 If startup reports `org.freedesktop.DBus.Error.AccessDenied` for `org.ofono.Manager.GetModems`,
-add your runtime user to the `ofono` group and re-login:
-
-```
-sudo usermod -aG ofono $USER
-```
+follow the steps in the **Small oFono configuration** section above.
 
 If `oFono` is running but no modem is found, verify your modem stack and confirm `GetModems()` returns at least one modem.
