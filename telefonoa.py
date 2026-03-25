@@ -4,20 +4,16 @@
 # More information on this license can be read under https://opensource.org/licenses/MIT
 
 import RPi.GPIO as GPIO
-import datetime
 import dbus
-import dbus.mainloop.glib
-import wave
 import alsaaudio
 import yaml
-from gi.repository import GLib
+import logging
 
+from pathlib import Path
 import time
-from threading import Thread
-from threading import Event
-import queue as Queue
-import numpy as np
-import struct
+import wave
+import queue
+from threading import Event, Lock, Thread
 from subprocess import call
 
 
@@ -27,203 +23,324 @@ class RotaryDial(Thread):
     """
 
     def __init__(self, ns_pin, number_queue):
-        Thread.__init__(self)
+        super().__init__(daemon=True)
         self.pin = ns_pin
         self.number_q = number_queue
         GPIO.setup(self.pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
         self.value = 0
         self.pulse_threshold = 0.2
-        self.finish = False
-        GPIO.add_event_detect(ns_pin, GPIO.FALLING, callback=self.__increment, bouncetime=90)
+        self.poll_interval = 0.002
+        self.debounce_seconds = 0.09
+        self._stop_event = Event()
+        self._value_lock = Lock()
+        self._last_pulse_at = 0.0
+        self._uses_event_detect = False
+        self._last_state = GPIO.input(self.pin)
+        self._last_fall_at = 0.0
 
-    def __increment(self, pin_num):
+        try:
+            GPIO.remove_event_detect(self.pin)
+        except RuntimeError:
+            pass
+
+        try:
+            GPIO.add_event_detect(self.pin, GPIO.FALLING, callback=self._increment, bouncetime=90)
+            self._uses_event_detect = True
+        except RuntimeError as exc:
+            # Some kernels/drivers do not allow edge detection on this pin;
+            # keep working by sampling the pin directly in the thread loop.
+            print("Rotary GPIO event detect unavailable on pin %d, using polling (%s)" % (self.pin, exc))
+
+    def _increment(self, pin_num):
         """
         Increment function trigered each time a falling pulse is detected.
         :param pin_num: GPIO pin triggering the event (Can only be self.ns_pin here)
         """
-        self.value += 1
+        del pin_num
+        with self._value_lock:
+            self.value += 1
+            self._last_pulse_at = time.monotonic()
+
+    def _poll_pin(self):
+        current_state = GPIO.input(self.pin)
+        now = time.monotonic()
+
+        if self._last_state == GPIO.HIGH and current_state == GPIO.LOW:
+            if now - self._last_fall_at >= self.debounce_seconds:
+                self._increment(self.pin)
+                self._last_fall_at = now
+
+        self._last_state = current_state
 
     def run(self):
-        while not self.finish:
-            last_value = self.value
-            time.sleep(self.pulse_threshold)
-            if last_value != self.value:
-                pass
-            elif self.value != 0:
-                if self.value == 10:
-                    self.number_q.put(0)
-                else:
-                    self.number_q.put(self.value)
+        while not self._stop_event.is_set():
+            if not self._uses_event_detect:
+                self._poll_pin()
+                time.sleep(self.poll_interval)
+
+            with self._value_lock:
+                if self.value == 0:
+                    continue
+                if time.monotonic() - self._last_pulse_at < self.pulse_threshold:
+                    continue
+
+                dialed_value = self.value
                 self.value = 0
+
+            self.number_q.put(0 if dialed_value == 10 else dialed_value)
+
+    def stop(self):
+        self._stop_event.set()
+        try:
+            if self._uses_event_detect:
+                GPIO.remove_event_detect(self.pin)
+        except RuntimeError:
+            pass
+
+
+class AudioPlayer(object):
+    """
+    Single-threaded WAV player shared by the telephone and the phone manager.
+    """
+
+    def __init__(self, chunk_size=1024):
+        self.chunk_size = chunk_size
+        self._lock = Lock()
+        self._thread = None
+        self._stop_event = None
+        self._playback_id = 0
+
+    @property
+    def is_playing(self):
+        with self._lock:
+            return self._thread is not None and self._thread.is_alive()
+
+    def play(self, filename, loop=False):
+        self.stop()
+        stop_event = Event()
+        with self._lock:
+            self._playback_id += 1
+            playback_id = self._playback_id
+            self._stop_event = stop_event
+            self._thread = Thread(
+                target=self._play_file,
+                args=(Path(filename), loop, stop_event, playback_id),
+                daemon=True,
+            )
+            thread = self._thread
+        thread.start()
+
+    def stop(self):
+        with self._lock:
+            self._playback_id += 1
+            stop_event = self._stop_event
+            thread = self._thread
+            self._stop_event = None
+            self._thread = None
+
+        if stop_event is not None:
+            stop_event.set()
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=1)
+
+    def _play_file(self, filename, loop, stop_event, playback_id):
+        stream = None
+        try:
+            with wave.open(str(filename), "rb") as wav_file:
+                stream = alsaaudio.PCM(
+                    type=alsaaudio.PCM_PLAYBACK,
+                    mode=alsaaudio.PCM_NORMAL,
+                )
+                stream.setchannels(wav_file.getnchannels())
+                stream.setrate(wav_file.getframerate())
+
+                while not stop_event.is_set():
+                    data = wav_file.readframes(self.chunk_size)
+                    if data:
+                        stream.write(data)
+                        continue
+                    if not loop:
+                        break
+                    wav_file.rewind()
+        except Exception as exc:
+            print("Audio playback failed for %s: %s" % (filename, exc))
+        finally:
+            if stream is not None:
+                del stream
+            with self._lock:
+                if playback_id == self._playback_id:
+                    self._thread = None
+                    self._stop_event = None
+
+    def close(self):
+        self.stop()
 
 
 class PhoneManager(object):
-    CHUNK = 1024
+    POLL_INTERVAL_SECONDS = 0.5
 
-    def __init__(self):
+    def __init__(self, audio_player, asset_dir):
         """
         The PhoneManager class manages the calls and the communication with the ofono service.
         """
-        dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
-        bus = dbus.SystemBus()
-        manager = dbus.Interface(bus.get_object('org.ofono', '/'), 'org.ofono.Manager')
-        modems = manager.GetModems()
+        self.audio_player = audio_player
+        self.asset_dir = Path(asset_dir)
+        self.bus = dbus.SystemBus()
+        self.voice_call_manager = None
+        self.call_in_progress = False
+        self.available = False
+
+        logging.getLogger("dbus.proxies").setLevel(logging.WARNING)
+
+        try:
+            manager = dbus.Interface(self.bus.get_object('org.ofono', '/'), 'org.ofono.Manager')
+            modems = manager.GetModems()
+        except dbus.exceptions.DBusException as exc:
+            self._report_init_error(exc)
+            return
+
+        if not modems:
+            print("ofono is running but no modem is available")
+            return
 
         # Take the first modem (there should be actually only one in our case)
         modem = modems[0][0]
         print(modem)
-        self.org_ofono_obj = bus.get_object('org.ofono', modem)
+        self.org_ofono_obj = self.bus.get_object('org.ofono', modem)
         self.voice_call_manager = dbus.Interface(self.org_ofono_obj, 'org.ofono.VoiceCallManager')
 
-        self.call_in_progress = False
-        self._setup_dbus_loop()
+        self.available = True
+        self.call_in_progress = self._has_active_calls()
+        self._stop_event = Event()
+        self._monitor_thread = Thread(target=self._monitor_calls, daemon=True)
+        self._monitor_thread.start()
         print("Initialized")
 
-    def _setup_dbus_loop(self):
-        """
-        Sets up the D-Bus signals.
-        """
-        dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
-        self.loop = GLib.MainLoop()
-        self._thread = Thread(target=self.loop.run)
-        self._thread.start()
+    def _report_init_error(self, exc):
+        name = exc.get_dbus_name()
+        print("Cannot access ofono over D-Bus: %s" % name)
+        if name == 'org.freedesktop.DBus.Error.AccessDenied':
+            print("Permission denied: add the runtime user to the 'ofono' group and restart the session.")
+            print("Example: sudo usermod -aG ofono $USER")
+        else:
+            print(str(exc))
 
-        self.org_ofono_obj.connect_to_signal("CallAdded", self.set_call_in_progress,
-                                             dbus_interface='org.ofono.VoiceCallManager')
+    def _asset_path(self, filename):
+        return self.asset_dir / filename
 
-        self.org_ofono_obj.connect_to_signal("CallRemoved", self.set_call_ended,
-                                             dbus_interface='org.ofono.VoiceCallManager')
+    def _has_active_calls(self):
+        if self.voice_call_manager is None:
+            return False
+        try:
+            return bool(self.voice_call_manager.GetCalls())
+        except dbus.exceptions.DBusException:
+            return False
 
-    def set_call_in_progress(self, object, properties):
-        """
-        Event triggered when a call is initiated.
-        :param object: The address of the call object from ofono
-        :param properties: Properties of the call
-        :return:
-        """
-        print("Call in progress!")
-        self.call_in_progress = True
+    def _set_call_state(self, in_progress):
+        if in_progress == self.call_in_progress:
+            return
+        self.call_in_progress = in_progress
+        if in_progress:
+            print("Call in progress!")
+        else:
+            print("Call ended!")
 
-    def set_call_ended(self, object):
-        """
-        Event triggered when a call is ended
-        :param object: The address of the call object from ofono (just as reference, cannot be fetched anymore)
-        :return:
-        """
-        print("Call ended!")
-        self.call_in_progress = False
+    def _monitor_calls(self):
+        while not self._stop_event.wait(self.POLL_INTERVAL_SECONDS):
+            self._set_call_state(self._has_active_calls())
 
     def end_call(self):
         """
         Method to finalize the current (all, actually) call
         """
+        if not self.available or self.voice_call_manager is None:
+            return
         self.voice_call_manager.HangupAll()
+        self._set_call_state(False)
 
     def call(self, number, hide_id='default'):
         """
         Method to place call. It handles incorrectly dialed numbers thanks to ofono exceptions
         """
+        if not self.available or self.voice_call_manager is None:
+            print("Call system not available")
+            self.audio_player.play(self._asset_path("not_connected.wav"))
+            return
         try:
             self.voice_call_manager.Dial(str(number), hide_id)
+            self._set_call_state(True)
         except dbus.exceptions.DBusException as e:
             name = e.get_dbus_name()
             if name == 'org.freedesktop.DBus.Error.UnknownMethod':
                 print("Ofono not running")
-                self.start_file("/home/pi/telefonoa/not_connected.wav")
+                self.audio_player.play(self._asset_path("not_connected.wav"))
             elif name == 'org.ofono.Error.InvalidFormat':
                 print("Invalid dialed number format!")
-                self.start_file("/home/pi/telefonoa/format_incorrect.wav")
+                self.audio_player.play(self._asset_path("format_incorrect.wav"))
             else:
                 print(name)
 
-    def start_file(self, filename, loop=False):
-        """
-        Start a thread reproducing an audio file
-        :param filename: The name of the file to play
-        :param loop: If the file should be played as a loop (like in the case of the dial tone)
-        """
-        self._thread = Thread(target=self.__play_file, args=[filename, loop])
-        self._thread.start()
-        self.playing_audio = True
-
-    def __play_file(self, filename, loop):
-        """
-        Private function handling the wav file replay
-        :param filename: The name of the file to play
-        :param loop: If the file should be played as a loop (like in the case of the dial tone)
-        """
-        self.stop_audio = False
-        if not loop:
-            # open a wav format music
-            f = wave.open(filename, "rb")
-            # open stream
-            stream = alsaaudio.PCM(type=alsaaudio.PCM_PLAYBACK,
-                                   mode=alsaaudio.PCM_NORMAL)
-            stream.setchannels(f.getnchannels())
-            stream.setrate(f.getframerate())
-            # read data
-            data = f.readframes(self.CHUNK)
-
-            # play stream
-            while data and not self.stop_audio:
-                stream.write(data)
-                data = f.readframes(self.CHUNK)
-        else:
-            # open a wav format music
-            f = wave.open(filename, "rb")
-            # open stream
-            stream = alsaaudio.PCM(type=alsaaudio.PCM_PLAYBACK,
-                                   mode=alsaaudio.PCM_NORMAL)
-            stream.setchannels(f.getnchannels())
-            stream.setrate(f.getframerate())
-            # read data
-            data = f.readframes(self.CHUNK)
-
-            # play stream
-            while loop and not self.stop_audio:
-                f.rewind()
-                data = f.readframes(self.CHUNK)
-                while data and not self.stop_audio:
-                    stream.write(data)
-                    data = f.readframes(self.CHUNK)
+    def close(self):
+        if not self.available:
+            return
+        self._stop_event.set()
+        if self._monitor_thread.is_alive():
+            self._monitor_thread.join(timeout=1)
 
 
 class Telephone(object):
     """
     Main Telephone class containing everything required for the Bluetooth telephone to work.
     """
-    CHUNK = 1024
-
     def __init__(self, num_pin, receiver_pin):
         GPIO.setmode(GPIO.BCM)
+        self.asset_dir = Path(__file__).resolve().parent
         self.receiver_pin = receiver_pin
-        self.number_q = Queue.Queue()
-        self.phone_manager = PhoneManager()
+        GPIO.setup(self.receiver_pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+        self.number_q = queue.Queue()
+        self.audio_player = AudioPlayer()
+        self.phone_manager = PhoneManager(self.audio_player, self.asset_dir)
         self.rotary_dial = RotaryDial(num_pin, self.number_q)
-        self.stop_audio = False
-        self.playing_audio = False
         self.finish = False
+        self.receiver_down = self._is_receiver_down()
 
         # Load fast_dial numbers
-        with open("phonebook.yaml", 'r') as stream:
-            self.phonebook = yaml.safe_load(stream)
+        with (self.asset_dir / "phonebook.yaml").open('r') as stream:
+            self.phonebook = yaml.safe_load(stream) or []
 
         print(self.phonebook)
 
         # Receiver relevant functions
-        GPIO.setup(self.receiver_pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-        if GPIO.input(self.receiver_pin) is GPIO.HIGH:
-            self.receiver_down = False
-        else:
-            self.receiver_down = True
-        self.receiver_changed(self.receiver_pin)
-        GPIO.add_event_detect(self.receiver_pin, GPIO.BOTH, callback=self.receiver_changed, bouncetime=10)
+        self._apply_receiver_state()
+        self._receiver_event_detect = False
+        self._queue_timeout = 5
+        try:
+            GPIO.remove_event_detect(self.receiver_pin)
+        except RuntimeError:
+            pass
+        try:
+            GPIO.add_event_detect(self.receiver_pin, GPIO.BOTH, callback=self.receiver_changed, bouncetime=10)
+            self._receiver_event_detect = True
+        except RuntimeError as exc:
+            print("Receiver GPIO event detect unavailable on pin %d, using polling (%s)" % (self.receiver_pin, exc))
+            self._queue_timeout = 0.2
 
         # Start all threads
         self.rotary_dial.start()
 
         # Anounce ready
-        self.start_file("/home/pi/telefonoa/ready.wav")
+        self.start_file(self.asset_dir / "ready.wav")
+
+    def _is_receiver_down(self):
+        return GPIO.input(self.receiver_pin) == GPIO.HIGH
+
+    def _apply_receiver_state(self):
+        if self.receiver_down:
+            if self.phone_manager.call_in_progress:
+                self.phone_manager.end_call()
+            self.stop_file()
+            return
+        self.start_file(self.asset_dir / "dial_tone.wav", loop=True)
 
     def receiver_changed(self, pin_num):
         """
@@ -231,14 +348,12 @@ class Telephone(object):
         :param pin_num: GPIO pin triggering the event (Can only be self.receiver_pin here)
         :return:
         """
-        if self.receiver_down:
-            self.receiver_down = False
-            self.start_file("/home/pi/telefonoa/dial_tone.wav", loop=True)
-        else:
-            if self.phone_manager.call_in_progress:
-                self.phone_manager.end_call()
-            self.receiver_down = True
-            self.stop_file()
+        del pin_num
+        new_state = self._is_receiver_down()
+        if new_state == self.receiver_down:
+            return
+        self.receiver_down = new_state
+        self._apply_receiver_state()
 
     def start_file(self, filename, loop=False):
         """
@@ -246,54 +361,10 @@ class Telephone(object):
         :param filename: The name of the file to play
         :param loop: If the file should be played as a loop (like in the case of the dial tone)
         """
-        self._thread = Thread(target=self.__play_file, args=[filename, loop])
-        self._thread.start()
-        self.playing_audio = True
-
-    def __play_file(self, filename, loop):
-        """
-        Private function handling the wav file replay
-        :param filename: The name of the file to play
-        :param loop: If the file should be played as a loop (like in the case of the dial tone)
-        """
-        self.stop_audio = False
-        if not loop:
-            # open a wav format music
-            f = wave.open(filename, "rb")
-            # open stream
-            stream = alsaaudio.PCM(type=alsaaudio.PCM_PLAYBACK,
-                                   mode=alsaaudio.PCM_NORMAL)
-            stream.setchannels(f.getnchannels())
-            stream.setrate(f.getframerate())
-            # read data
-            data = f.readframes(self.CHUNK)
-
-            # play stream
-            while data and not self.stop_audio:
-                stream.write(data)
-                data = f.readframes(self.CHUNK)
-        else:
-            # open a wav format music
-            f = wave.open(filename, "rb")
-            # open stream
-            stream = alsaaudio.PCM(type=alsaaudio.PCM_PLAYBACK,
-                                   mode=alsaaudio.PCM_NORMAL)
-            stream.setchannels(f.getnchannels())
-            stream.setrate(f.getframerate())
-            # read data
-            data = f.readframes(self.CHUNK)
-
-            # play stream
-            while loop and not self.stop_audio:
-                f.rewind()
-                data = f.readframes(self.CHUNK)
-                while data and not self.stop_audio:
-                    stream.write(data)
-                    data = f.readframes(self.CHUNK)
+        self.audio_player.play(filename, loop=loop)
 
     def stop_file(self):
-        self.stop_audio = True
-        self.playing_audio = False
+        self.audio_player.stop()
 
     def dialing_handler(self):
         """
@@ -302,41 +373,50 @@ class Telephone(object):
         """
         number = ''
         while not self.finish:
+            if not self._receiver_event_detect:
+                new_state = self._is_receiver_down()
+                if new_state != self.receiver_down:
+                    self.receiver_down = new_state
+                    self._apply_receiver_state()
+
             if not self.receiver_down:  # Handling of the dialing when the receiver is lifted
                 try:
-                    c = self.number_q.get(timeout=5)
+                    c = self.number_q.get(timeout=self._queue_timeout)
                     number += str(c)
-                except Queue.Empty:
-                    if number is not '':
+                except queue.Empty:
+                    if number != '':
                         print("Dialing: %s" % number)
                         self.stop_file()
                         self.phone_manager.call(number)
                         number = ''
-                    pass
 
             else:  # Handling of the dialing when the receiver is down
-                if self.playing_audio:
+                if self.audio_player.is_playing:
                     self.stop_file()
                 try:
-                    c = self.number_q.get(timeout=5)
+                    c = self.number_q.get(timeout=self._queue_timeout)
                     print("Selected %d" % c)
                     if c == 9:
                         print("Turning system off")
-                        self.start_file("/home/pi/telefonoa/turnoff.wav")
+                        self.start_file(self.asset_dir / "turnoff.wav")
                         time.sleep(6)
                         call("sudo shutdown -h now", shell=True)
-                    elif c <= len(self.phonebook):
+                    elif 1 <= c <= len(self.phonebook):
                         print("Shortcut action %d: Automatic dial" % c)
                         number = self.phonebook[c - 1]['number']
                         print(number)
                         time.sleep(4)
                         self.phone_manager.call(number)
-                except Queue.Empty:
+                except queue.Empty:
                     pass
 
     def close(self):
-        self.rotary_dial.finish = True
-        self.phone_manager.loop.quit()
+        self.finish = True
+        self.rotary_dial.stop()
+        if self.rotary_dial.is_alive():
+            self.rotary_dial.join(timeout=1)
+        self.phone_manager.close()
+        self.audio_player.close()
         GPIO.cleanup()
 
 
