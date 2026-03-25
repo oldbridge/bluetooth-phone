@@ -8,6 +8,8 @@ import dbus
 import alsaaudio
 import yaml
 import logging
+import math
+import struct
 
 from pathlib import Path
 import time
@@ -141,6 +143,21 @@ class AudioPlayer(object):
             thread = self._thread
         thread.start()
 
+    def play_tone_pattern(self, frequency_hz=450.0, on_ms=125, off_ms=375, sample_rate=8000):
+        self.stop()
+        stop_event = Event()
+        with self._lock:
+            self._playback_id += 1
+            playback_id = self._playback_id
+            self._stop_event = stop_event
+            self._thread = Thread(
+                target=self._play_tone_pattern,
+                args=(frequency_hz, on_ms, off_ms, sample_rate, stop_event, playback_id),
+                daemon=True,
+            )
+            thread = self._thread
+        thread.start()
+
     def stop(self):
         with self._lock:
             self._playback_id += 1
@@ -175,6 +192,45 @@ class AudioPlayer(object):
                     wav_file.rewind()
         except Exception as exc:
             print("Audio playback failed for %s: %s" % (filename, exc))
+        finally:
+            if stream is not None:
+                del stream
+            with self._lock:
+                if playback_id == self._playback_id:
+                    self._thread = None
+                    self._stop_event = None
+
+    def _play_tone_pattern(self, frequency_hz, on_ms, off_ms, sample_rate, stop_event, playback_id):
+        stream = None
+        try:
+            stream = alsaaudio.PCM(
+                type=alsaaudio.PCM_PLAYBACK,
+                mode=alsaaudio.PCM_NORMAL,
+            )
+            stream.setchannels(1)
+            stream.setrate(sample_rate)
+            stream.setformat(alsaaudio.PCM_FORMAT_S16_LE)
+
+            on_frames = max(1, int(sample_rate * (on_ms / 1000.0)))
+            off_frames = max(1, int(sample_rate * (off_ms / 1000.0)))
+
+            amplitude = int(32767 * 0.3)
+            phase_step = (2.0 * math.pi * frequency_hz) / sample_rate
+
+            on_buffer = bytearray()
+            for i in range(on_frames):
+                sample = int(amplitude * math.sin(phase_step * i))
+                on_buffer.extend(struct.pack('<h', sample))
+
+            off_buffer = b'\x00\x00' * off_frames
+
+            while not stop_event.is_set():
+                stream.write(on_buffer)
+                if stop_event.is_set():
+                    break
+                stream.write(off_buffer)
+        except Exception as exc:
+            print("Tone playback failed: %s" % exc)
         finally:
             if stream is not None:
                 del stream
@@ -384,6 +440,47 @@ class PhoneManager(object):
         if self._monitor_thread.is_alive():
             self._monitor_thread.join(timeout=1)
 
+    def has_paired_device(self, require_connected=True):
+        """Return True when at least one usable BlueZ device is present."""
+        try:
+            object_manager = dbus.Interface(
+                self.bus.get_object('org.bluez', '/'),
+                'org.freedesktop.DBus.ObjectManager',
+            )
+            managed_objects = object_manager.GetManagedObjects()
+            found = False
+            for path, ifaces in managed_objects.items():
+                device = ifaces.get('org.bluez.Device1')
+                if not device:
+                    continue
+
+                paired = bool(device.get('Paired', False))
+                connected = bool(device.get('Connected', False))
+                blocked = bool(device.get('Blocked', False))
+                alias = str(device.get('Alias', 'unknown'))
+                address = str(device.get('Address', path))
+                print("[BT] Device %s (%s): paired=%s connected=%s blocked=%s" % (
+                    alias,
+                    address,
+                    paired,
+                    connected,
+                    blocked,
+                ))
+
+                if not paired or blocked:
+                    continue
+                if require_connected and not connected:
+                    continue
+
+                found = True
+                break
+
+            print("[BT] Usable device present=%s (require_connected=%s)" % (found, require_connected))
+            return found
+        except dbus.exceptions.DBusException as exc:
+            print("Cannot query BlueZ paired devices: %s" % exc)
+            return False
+
 
 class Telephone(object):
     """
@@ -407,6 +504,7 @@ class Telephone(object):
         self.phone_manager.on_incoming_call_changed = self._on_incoming_call_changed
         self.rotary_dial = RotaryDial(num_pin, self.number_q)
         self.finish = False
+        self._last_receiver_raw_state = None
         self.receiver_down = self._is_receiver_down()
         self._manual_number = ''
         self._last_digit_at = None
@@ -442,7 +540,16 @@ class Telephone(object):
         self.start_file(self.asset_dir / "ready.wav")
 
     def _is_receiver_down(self):
-        return GPIO.input(self.receiver_pin) == GPIO.HIGH
+        raw_state = GPIO.input(self.receiver_pin)
+        is_down = raw_state == GPIO.HIGH
+        if raw_state != self._last_receiver_raw_state:
+            print("[HOOK] Read pin %d: raw=%d -> receiver_%s" % (
+                self.receiver_pin,
+                raw_state,
+                'down' if is_down else 'up',
+            ))
+            self._last_receiver_raw_state = raw_state
+        return is_down
 
     def _clear_manual_dial_state(self):
         self._manual_number = ''
@@ -486,6 +593,7 @@ class Telephone(object):
         self._set_ringer(False)
 
     def _apply_receiver_state(self):
+        print("[HOOK] Applying state: receiver_%s" % ('down' if self.receiver_down else 'up'))
         if self.receiver_down:
             self._clear_manual_dial_state()
             self._stop_ringing()
@@ -497,6 +605,14 @@ class Telephone(object):
         if self.phone_manager.incoming_call:
             self.phone_manager.answer_call()
             return
+        has_paired_device = self.phone_manager.has_paired_device(require_connected=True)
+        if not self.phone_manager.available or not has_paired_device:
+            print("System not available for dialing (ofono_available=%s, paired_and_connected_device=%s)" % (
+                self.phone_manager.available,
+                has_paired_device,
+            ))
+            self.start_busy_tone()
+            return
         self.start_file(self.asset_dir / "dial_tone.wav", loop=True)
 
     def receiver_changed(self, pin_num):
@@ -505,10 +621,17 @@ class Telephone(object):
         :param pin_num: GPIO pin triggering the event (Can only be self.receiver_pin here)
         :return:
         """
-        del pin_num
+        print("[HOOK] GPIO callback on pin %d" % pin_num)
         new_state = self._is_receiver_down()
         if new_state == self.receiver_down:
+            print("[HOOK] Callback ignored (no state change): still receiver_%s" % (
+                'down' if self.receiver_down else 'up',
+            ))
             return
+        print("[HOOK] Callback state change: receiver_%s -> receiver_%s" % (
+            'down' if self.receiver_down else 'up',
+            'down' if new_state else 'up',
+        ))
         self.receiver_down = new_state
         self._apply_receiver_state()
 
@@ -519,6 +642,10 @@ class Telephone(object):
         :param loop: If the file should be played as a loop (like in the case of the dial tone)
         """
         self.audio_player.play(filename, loop=loop)
+
+    def start_busy_tone(self):
+        # Besetztton cadence: 450 Hz, 125 ms ON / 375 ms OFF.
+        self.audio_player.play_tone_pattern(frequency_hz=450.0, on_ms=125, off_ms=375)
 
     def stop_file(self):
         self.audio_player.stop()
@@ -553,6 +680,10 @@ class Telephone(object):
             if not self._receiver_event_detect:
                 new_state = self._is_receiver_down()
                 if new_state != self.receiver_down:
+                    print("[HOOK] Polling state change: receiver_%s -> receiver_%s" % (
+                        'down' if self.receiver_down else 'up',
+                        'down' if new_state else 'up',
+                    ))
                     self.receiver_down = new_state
                     self._apply_receiver_state()
 
