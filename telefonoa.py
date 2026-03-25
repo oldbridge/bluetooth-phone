@@ -352,7 +352,9 @@ class Telephone(object):
         GPIO.setmode(GPIO.BCM)
         self.asset_dir = Path(__file__).resolve().parent
         self.receiver_pin = receiver_pin
+        self.ringer_pin = 18
         GPIO.setup(self.receiver_pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+        GPIO.setup(self.ringer_pin, GPIO.OUT, initial=GPIO.HIGH)
         self.number_q = queue.Queue()
         self.audio_player = AudioPlayer()
         self.phone_manager = PhoneManager(self.audio_player, self.asset_dir)
@@ -422,6 +424,20 @@ class Telephone(object):
     def stop_file(self):
         self.audio_player.stop()
 
+    def _set_ringer(self, enabled):
+        # This relay/generator is active-low: LOW rings, HIGH is silent.
+        GPIO.output(self.ringer_pin, GPIO.LOW if enabled else GPIO.HIGH)
+
+    def ringer_test(self):
+        print("Ringer test: start")
+        # 2x classic ring cadence: 1s ON, 1s OFF.
+        for _ in range(2):
+            self._set_ringer(True)
+            time.sleep(1)
+            self._set_ringer(False)
+            time.sleep(1)
+        print("Ringer test: done")
+
     def dialing_handler(self):
         """
         Main function of the telephone that handles the dialing if the receiver is lifted or hooked.
@@ -464,6 +480,8 @@ class Telephone(object):
                         self.start_file(self.asset_dir / "turnoff.wav")
                         time.sleep(6)
                         call("sudo shutdown -h now", shell=True)
+                    elif c == 5:
+                        self.ringer_test()
                     elif 1 <= c <= len(self.phonebook):
                         print("Shortcut action %d: Automatic dial" % c)
                         number = str(self.phonebook[c - 1].get('number', '')).strip()
@@ -479,12 +497,14 @@ class Telephone(object):
 
     def close(self):
         self.finish = True
+        self._set_ringer(False)
         self.rotary_dial.stop()
         if self.rotary_dial.is_alive():
             self.rotary_dial.join(timeout=1)
         self.phone_manager.close()
         self.audio_player.close()
-        GPIO.cleanup()
+        # Do not cleanup ringer_pin so it stays HIGH (silent) after process exit.
+        GPIO.cleanup((self.receiver_pin, self.rotary_dial.pin))
 
 
 if __name__ == '__main__':
