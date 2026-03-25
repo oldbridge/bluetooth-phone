@@ -199,6 +199,8 @@ class PhoneManager(object):
         self.bus = dbus.SystemBus()
         self.voice_call_manager = None
         self.call_in_progress = False
+        self.incoming_call = False
+        self.on_incoming_call_changed = None
         self.available = False
 
         logging.getLogger("dbus.proxies").setLevel(logging.WARNING)
@@ -221,7 +223,9 @@ class PhoneManager(object):
         self.voice_call_manager = dbus.Interface(self.org_ofono_obj, 'org.ofono.VoiceCallManager')
 
         self.available = True
-        self.call_in_progress = self._has_active_calls()
+        has_call, has_incoming = self._get_call_info()
+        self.call_in_progress = has_call
+        self.incoming_call = has_incoming
         self._stop_event = Event()
         self._monitor_thread = Thread(target=self._monitor_calls, daemon=True)
         self._monitor_thread.start()
@@ -239,13 +243,19 @@ class PhoneManager(object):
     def _asset_path(self, filename):
         return self.asset_dir / filename
 
-    def _has_active_calls(self):
+    def _get_call_info(self):
+        """Returns (has_any_call, has_incoming_call)."""
         if self.voice_call_manager is None:
-            return False
+            return False, False
         try:
-            return bool(self.voice_call_manager.GetCalls())
+            calls = self.voice_call_manager.GetCalls()
+            if not calls:
+                return False, False
+            states = {str(props.get('State', '')) for _, props in calls}
+            has_incoming = 'incoming' in states
+            return True, has_incoming
         except dbus.exceptions.DBusException:
-            return False
+            return False, False
 
     def _set_call_state(self, in_progress):
         if in_progress == self.call_in_progress:
@@ -256,9 +266,22 @@ class PhoneManager(object):
         else:
             print("Call ended!")
 
+    def _set_incoming_state(self, is_incoming):
+        if is_incoming == self.incoming_call:
+            return
+        self.incoming_call = is_incoming
+        if is_incoming:
+            print("Incoming call!")
+        else:
+            print("Incoming call ended or answered.")
+        if self.on_incoming_call_changed is not None:
+            self.on_incoming_call_changed(is_incoming)
+
     def _monitor_calls(self):
         while not self._stop_event.wait(self.POLL_INTERVAL_SECONDS):
-            self._set_call_state(self._has_active_calls())
+            has_call, has_incoming = self._get_call_info()
+            self._set_call_state(has_call)
+            self._set_incoming_state(has_incoming)
 
     def end_call(self):
         """
@@ -268,6 +291,24 @@ class PhoneManager(object):
             return
         self.voice_call_manager.HangupAll()
         self._set_call_state(False)
+        self._set_incoming_state(False)
+
+    def answer_call(self):
+        """Answer an incoming call."""
+        if not self.available or self.voice_call_manager is None:
+            return
+        try:
+            calls = self.voice_call_manager.GetCalls()
+            for path, props in calls:
+                if str(props.get('State', '')) == 'incoming':
+                    call_obj = self.bus.get_object('org.ofono', path)
+                    call_iface = dbus.Interface(call_obj, 'org.ofono.VoiceCall')
+                    call_iface.Answer()
+                    self._set_call_state(True)
+                    self._set_incoming_state(False)
+                    return
+        except dbus.exceptions.DBusException as e:
+            print("Failed to answer call: %s" % e)
 
     def _normalize_number(self, number):
         # Keep only digits and one optional leading plus for oFono dial.
@@ -358,6 +399,12 @@ class Telephone(object):
         self.number_q = queue.Queue()
         self.audio_player = AudioPlayer()
         self.phone_manager = PhoneManager(self.audio_player, self.asset_dir)
+        self._ring_stop_event = Event()
+        self._ring_lock = Lock()
+        self._ringer_io_lock = Lock()
+        self._ringer_test_active = Event()
+        self._ring_thread = None
+        self.phone_manager.on_incoming_call_changed = self._on_incoming_call_changed
         self.rotary_dial = RotaryDial(num_pin, self.number_q)
         self.finish = False
         self.receiver_down = self._is_receiver_down()
@@ -401,12 +448,54 @@ class Telephone(object):
         self._manual_number = ''
         self._last_digit_at = None
 
+    def _on_incoming_call_changed(self, is_incoming):
+        """Called from the PhoneManager monitor thread when incoming call state changes."""
+        if self._ringer_test_active.is_set():
+            return
+        if is_incoming and self.receiver_down:
+            self._start_ringing()
+        else:
+            self._stop_ringing()
+
+    def _start_ringing(self):
+        with self._ring_lock:
+            if self._ring_thread is not None and self._ring_thread.is_alive():
+                return
+            self._ring_stop_event.clear()
+            self._ring_thread = Thread(target=self._ring_pattern, daemon=True)
+            self._ring_thread.start()
+
+    def _stop_ringing(self):
+        with self._ring_lock:
+            self._ring_stop_event.set()
+            thread = self._ring_thread
+            self._ring_thread = None
+        if not self._ringer_test_active.is_set():
+            self._set_ringer(False)
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=2)
+
+    def _ring_pattern(self):
+        """Ring pattern: 1s ON, 4s OFF, repeating."""
+        while not self._ring_stop_event.is_set():
+            self._set_ringer(True)
+            if self._ring_stop_event.wait(1.0):
+                break
+            self._set_ringer(False)
+            self._ring_stop_event.wait(4.0)
+        self._set_ringer(False)
+
     def _apply_receiver_state(self):
         if self.receiver_down:
             self._clear_manual_dial_state()
-            if self.phone_manager.call_in_progress:
+            self._stop_ringing()
+            if self.phone_manager.call_in_progress or self.phone_manager.incoming_call:
                 self.phone_manager.end_call()
             self.stop_file()
+            return
+        self._stop_ringing()
+        if self.phone_manager.incoming_call:
+            self.phone_manager.answer_call()
             return
         self.start_file(self.asset_dir / "dial_tone.wav", loop=True)
 
@@ -436,16 +525,23 @@ class Telephone(object):
 
     def _set_ringer(self, enabled):
         # This relay/generator is active-low: LOW rings, HIGH is silent.
-        GPIO.output(self.ringer_pin, GPIO.LOW if enabled else GPIO.HIGH)
+        with self._ringer_io_lock:
+            GPIO.output(self.ringer_pin, GPIO.LOW if enabled else GPIO.HIGH)
 
     def ringer_test(self):
         print("Ringer test: start")
-        # 2x classic ring cadence: 1s ON, 1s OFF.
-        for _ in range(2):
-            self._set_ringer(True)
-            time.sleep(1)
+        self._stop_ringing()
+        self._ringer_test_active.set()
+        try:
+            # 2x classic ring cadence: 1s ON, 1s OFF.
+            for _ in range(2):
+                self._set_ringer(True)
+                time.sleep(1)
+                self._set_ringer(False)
+                time.sleep(1)
+        finally:
+            self._ringer_test_active.clear()
             self._set_ringer(False)
-            time.sleep(1)
         print("Ringer test: done")
 
     def dialing_handler(self):
@@ -507,6 +603,7 @@ class Telephone(object):
 
     def close(self):
         self.finish = True
+        self._stop_ringing()
         self._set_ringer(False)
         self.rotary_dial.stop()
         if self.rotary_dial.is_alive():
