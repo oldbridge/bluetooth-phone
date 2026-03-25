@@ -361,6 +361,11 @@ class Telephone(object):
         self.rotary_dial = RotaryDial(num_pin, self.number_q)
         self.finish = False
         self.receiver_down = self._is_receiver_down()
+        self._manual_number = ''
+        self._last_digit_at = None
+        self._dial_complete_pause = 5.0
+        self._min_lifted_digits_to_call = 3
+        self._lifted_queue_timeout = 0.2
 
         # Load fast_dial numbers
         with (self.asset_dir / "phonebook.yaml").open('r') as stream:
@@ -392,8 +397,13 @@ class Telephone(object):
     def _is_receiver_down(self):
         return GPIO.input(self.receiver_pin) == GPIO.HIGH
 
+    def _clear_manual_dial_state(self):
+        self._manual_number = ''
+        self._last_digit_at = None
+
     def _apply_receiver_state(self):
         if self.receiver_down:
+            self._clear_manual_dial_state()
             if self.phone_manager.call_in_progress:
                 self.phone_manager.end_call()
             self.stop_file()
@@ -443,7 +453,6 @@ class Telephone(object):
         Main function of the telephone that handles the dialing if the receiver is lifted or hooked.
         :return:
         """
-        number = ''
         while not self.finish:
             if not self._receiver_event_detect:
                 new_state = self._is_receiver_down()
@@ -453,23 +462,24 @@ class Telephone(object):
 
             if not self.receiver_down:  # Handling of the dialing when the receiver is lifted
                 try:
-                    c = self.number_q.get(timeout=self._queue_timeout)
-                    number += str(c)
+                    c = self.number_q.get(timeout=self._lifted_queue_timeout)
+                    self._manual_number += str(c)
+                    self._last_digit_at = time.monotonic()
                 except queue.Empty:
-                    if number != '':
-                        number_to_call = number
-                        if len(number) == 1 and number.isdigit():
-                            shortcut = int(number)
-                            if 1 <= shortcut <= len(self.phonebook):
-                                number_to_call = str(self.phonebook[shortcut - 1].get('number', '')).strip()
-                                print("Dialing shortcut %d -> %s" % (shortcut, number_to_call))
+                    pass
 
-                        print("Dialing: %s" % number_to_call)
+                if self._manual_number and self._last_digit_at is not None:
+                    # Rotary-style: wait for a pause between pulses before placing the call.
+                    if len(self._manual_number) < self._min_lifted_digits_to_call:
+                        continue
+                    if time.monotonic() - self._last_digit_at >= self._dial_complete_pause:
+                        print("Dialing: %s" % self._manual_number)
                         self.stop_file()
-                        self.phone_manager.call(number_to_call)
-                        number = ''
+                        self.phone_manager.call(self._manual_number)
+                        self._clear_manual_dial_state()
 
             else:  # Handling of the dialing when the receiver is down
+                self._clear_manual_dial_state()
                 if self.audio_player.is_playing:
                     self.stop_file()
                 try:
@@ -484,14 +494,14 @@ class Telephone(object):
                         self.ringer_test()
                     elif 1 <= c <= len(self.phonebook):
                         print("Shortcut action %d: Automatic dial" % c)
-                        number = str(self.phonebook[c - 1].get('number', '')).strip()
-                        if not number:
+                        shortcut_number = str(self.phonebook[c - 1].get('number', '')).strip()
+                        if not shortcut_number:
                             print("Invalid phonebook number for shortcut %d" % c)
                             self.start_file(self.asset_dir / "format_incorrect.wav")
                             continue
-                        print(number)
+                        print(shortcut_number)
                         time.sleep(4)
-                        self.phone_manager.call(number)
+                        self.phone_manager.call(shortcut_number)
                 except queue.Empty:
                     pass
 
