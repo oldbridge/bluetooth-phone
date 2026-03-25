@@ -17,6 +17,17 @@ from threading import Event, Lock, Thread
 from subprocess import call
 
 
+class PhonebookLoader(yaml.SafeLoader):
+    """YAML loader keeping phone numbers like +34... as strings."""
+
+
+# Do not auto-cast integers, otherwise +346... loses the leading plus sign.
+for key, resolvers in list(PhonebookLoader.yaml_implicit_resolvers.items()):
+    PhonebookLoader.yaml_implicit_resolvers[key] = [
+        (tag, regexp) for tag, regexp in resolvers if tag != 'tag:yaml.org,2002:int'
+    ]
+
+
 class RotaryDial(Thread):
     """
     Thread class reading the dialed values and putting them into a thread queue
@@ -258,6 +269,34 @@ class PhoneManager(object):
         self.voice_call_manager.HangupAll()
         self._set_call_state(False)
 
+    def _normalize_number(self, number):
+        # Keep only digits and one optional leading plus for oFono dial.
+        raw = str(number).strip()
+        if not raw:
+            return ''
+
+        has_plus = raw.startswith('+')
+        digits = ''.join(ch for ch in raw if ch.isdigit())
+        if not digits:
+            return ''
+        return ('+' if has_plus else '') + digits
+
+    def _dial_candidates(self, normalized_number):
+        candidates = [normalized_number]
+        if normalized_number.startswith('+'):
+            national = normalized_number[1:]
+            candidates.append(national)
+            candidates.append('00' + national)
+        elif normalized_number.startswith('00') and len(normalized_number) > 2:
+            candidates.append('+' + normalized_number[2:])
+
+        # Preserve order while dropping duplicates/empty values.
+        unique = []
+        for candidate in candidates:
+            if candidate and candidate not in unique:
+                unique.append(candidate)
+        return unique
+
     def call(self, number, hide_id='default'):
         """
         Method to place call. It handles incorrectly dialed numbers thanks to ofono exceptions
@@ -266,17 +305,34 @@ class PhoneManager(object):
             print("Call system not available")
             self.audio_player.play(self._asset_path("not_connected.wav"))
             return
+
+        normalized_number = self._normalize_number(number)
+        if not normalized_number:
+            print("Invalid dialed number format!")
+            self.audio_player.play(self._asset_path("format_incorrect.wav"))
+            return
+
+        candidates = self._dial_candidates(normalized_number)
+        hide_id_candidates = [hide_id, 'default', '']
+        hide_id_candidates = [h for i, h in enumerate(hide_id_candidates) if h not in hide_id_candidates[:i]]
         try:
-            self.voice_call_manager.Dial(str(number), hide_id)
-            self._set_call_state(True)
+            for candidate in candidates:
+                for hide_id_option in hide_id_candidates:
+                    try:
+                        print("Dialing via oFono: %s (hide_id=%r)" % (candidate, hide_id_option))
+                        self.voice_call_manager.Dial(candidate, hide_id_option)
+                        self._set_call_state(True)
+                        return
+                    except dbus.exceptions.DBusException as e:
+                        if e.get_dbus_name() != 'org.ofono.Error.InvalidFormat':
+                            raise
+            print("Invalid dialed number format!")
+            self.audio_player.play(self._asset_path("format_incorrect.wav"))
         except dbus.exceptions.DBusException as e:
             name = e.get_dbus_name()
             if name == 'org.freedesktop.DBus.Error.UnknownMethod':
                 print("Ofono not running")
                 self.audio_player.play(self._asset_path("not_connected.wav"))
-            elif name == 'org.ofono.Error.InvalidFormat':
-                print("Invalid dialed number format!")
-                self.audio_player.play(self._asset_path("format_incorrect.wav"))
             else:
                 print(name)
 
@@ -306,7 +362,7 @@ class Telephone(object):
 
         # Load fast_dial numbers
         with (self.asset_dir / "phonebook.yaml").open('r') as stream:
-            self.phonebook = yaml.safe_load(stream) or []
+            self.phonebook = yaml.load(stream, Loader=PhonebookLoader) or []
 
         print(self.phonebook)
 
@@ -385,9 +441,16 @@ class Telephone(object):
                     number += str(c)
                 except queue.Empty:
                     if number != '':
-                        print("Dialing: %s" % number)
+                        number_to_call = number
+                        if len(number) == 1 and number.isdigit():
+                            shortcut = int(number)
+                            if 1 <= shortcut <= len(self.phonebook):
+                                number_to_call = str(self.phonebook[shortcut - 1].get('number', '')).strip()
+                                print("Dialing shortcut %d -> %s" % (shortcut, number_to_call))
+
+                        print("Dialing: %s" % number_to_call)
                         self.stop_file()
-                        self.phone_manager.call(number)
+                        self.phone_manager.call(number_to_call)
                         number = ''
 
             else:  # Handling of the dialing when the receiver is down
@@ -403,7 +466,11 @@ class Telephone(object):
                         call("sudo shutdown -h now", shell=True)
                     elif 1 <= c <= len(self.phonebook):
                         print("Shortcut action %d: Automatic dial" % c)
-                        number = self.phonebook[c - 1]['number']
+                        number = str(self.phonebook[c - 1].get('number', '')).strip()
+                        if not number:
+                            print("Invalid phonebook number for shortcut %d" % c)
+                            self.start_file(self.asset_dir / "format_incorrect.wav")
+                            continue
                         print(number)
                         time.sleep(4)
                         self.phone_manager.call(number)
