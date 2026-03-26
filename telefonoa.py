@@ -719,25 +719,46 @@ class PhoneManager(object):
         return ('+' if has_plus else '') + digits
 
     def get_bt_device_address(self):
-        """Return Bluetooth address associated with the current oFono modem."""
-        if not self.bt_device_path:
-            return None
-
+        """Return Bluetooth address of the currently connected paired device.
+        
+        First tries the modem's associated device, then falls back to querying
+        BlueZ directly for any connected+paired device. This handles device
+        switches where oFono's cached path may not match the active device.
+        """
+        # Try modem-associated device first
+        if self.bt_device_path:
+            try:
+                dev_obj = self.bus.get_object('org.bluez', self.bt_device_path)
+                props_iface = dbus.Interface(dev_obj, 'org.freedesktop.DBus.Properties')
+                address = str(props_iface.Get('org.bluez.Device1', 'Address'))
+                connected = bool(props_iface.Get('org.bluez.Device1', 'Connected'))
+                if address and connected:
+                    return address
+            except dbus.exceptions.DBusException:
+                pass
+        
+        # Fallback: query BlueZ for ANY connected+paired device
         try:
-            dev_obj = self.bus.get_object('org.bluez', self.bt_device_path)
-            props_iface = dbus.Interface(dev_obj, 'org.freedesktop.DBus.Properties')
-            address = str(props_iface.Get('org.bluez.Device1', 'Address'))
-            if address:
-                return address
+            object_manager = dbus.Interface(
+                self.bus.get_object('org.bluez', '/'),
+                'org.freedesktop.DBus.ObjectManager',
+            )
+            managed_objects = object_manager.GetManagedObjects()
+            for path, ifaces in managed_objects.items():
+                device = ifaces.get('org.bluez.Device1')
+                if not device:
+                    continue
+                
+                paired = bool(device.get('Paired', False))
+                connected = bool(device.get('Connected', False))
+                blocked = bool(device.get('Blocked', False))
+                address = str(device.get('Address', ''))
+                
+                if paired and connected and not blocked and address:
+                    return address
         except dbus.exceptions.DBusException:
             pass
-
-        match = re.search(r'/dev_([0-9A-Fa-f_]+)$', self.bt_device_path)
-        if match:
-            candidate = match.group(1).replace('_', ':').upper()
-            if len(candidate) == 17:
-                return candidate
-
+        
         return None
 
     def _dial_candidates(self, normalized_number):
