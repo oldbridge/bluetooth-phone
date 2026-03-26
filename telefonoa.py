@@ -276,19 +276,25 @@ class UplinkBridge(object):
     def stop(self):
         with self._lock:
             thread = self._thread
-            self._thread = None
             self._stop_event.set()
         if thread is not None and thread.is_alive():
-            thread.join(timeout=1)
+            thread.join(timeout=2)
+        with self._lock:
+            if self._thread is thread:
+                self._thread = None
         print("[UPLINK] Stopped Python ALSA bridge")
 
     def _create_pcm(self, pcm_type, device):
-        pcm = alsaaudio.PCM(type=pcm_type, mode=alsaaudio.PCM_NORMAL, device=device)
-        pcm.setchannels(self.channels)
-        pcm.setrate(self.sample_rate)
-        pcm.setformat(alsaaudio.PCM_FORMAT_S16_LE)
-        pcm.setperiodsize(self.period_frames)
-        return pcm
+        mode = alsaaudio.PCM_NONBLOCK if pcm_type == alsaaudio.PCM_CAPTURE else alsaaudio.PCM_NORMAL
+        return alsaaudio.PCM(
+            type=pcm_type,
+            mode=mode,
+            device=device,
+            channels=self.channels,
+            rate=self.sample_rate,
+            format=alsaaudio.PCM_FORMAT_S16_LE,
+            periodsize=self.period_frames,
+        )
 
     def _wait_for_playback_ready(self):
         # The BlueALSA PCM can exist before audio transfer starts. Probe until writes succeed.
@@ -318,6 +324,7 @@ class UplinkBridge(object):
                 while not self._stop_event.is_set():
                     frames, data = capture.read()
                     if frames <= 0 or not data:
+                        time.sleep(0.01)
                         continue
                     playback.write(data)
             except alsaaudio.ALSAAudioError as exc:
@@ -328,6 +335,8 @@ class UplinkBridge(object):
                     del capture
                 if playback is not None:
                     del playback
+        with self._lock:
+            self._thread = None
 
 
 class PhoneManager(object):
@@ -432,9 +441,18 @@ class PhoneManager(object):
         """
         if not self.available or self.voice_call_manager is None:
             return
-        self.voice_call_manager.HangupAll()
-        self._set_call_state(False)
-        self._set_incoming_state(False)
+        try:
+            self.voice_call_manager.HangupAll()
+            self._set_call_state(False)
+            self._set_incoming_state(False)
+        except dbus.exceptions.DBusException as exc:
+            name = exc.get_dbus_name()
+            # oFono may transiently reject hangup while another call operation is active.
+            # Treat this as non-fatal so the main runtime loop keeps running.
+            if name == 'org.ofono.Error.InProgress':
+                print("Hangup in progress, keeping service alive")
+                return
+            print("Failed to hang up call: %s" % exc)
 
     def answer_call(self):
         """Answer an incoming call."""
@@ -686,8 +704,9 @@ class Telephone(object):
             self.uplink_bridge.stop()
             self._clear_manual_dial_state()
             self._stop_ringing()
-            if self.phone_manager.call_in_progress or self.phone_manager.incoming_call:
-                self.phone_manager.end_call()
+            # Always attempt hangup when placing the handset down. Relying on
+            # polled state flags can miss races and leave a call active.
+            self.phone_manager.end_call()
             self.stop_file()
             return
         self.uplink_bridge.start()
