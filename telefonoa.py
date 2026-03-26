@@ -790,6 +790,9 @@ class Telephone(object):
         self._dial_complete_pause = 5.0
         self._min_lifted_digits_to_call = 3
         self._lifted_queue_timeout = 0.2
+        self._wifi_iface = 'wlan0'
+        self._wifi_restore_needed = False
+        self._wifi_lock = Lock()
 
         # Load fast_dial numbers
         with (self.asset_dir / "phonebook.yaml").open('r') as stream:
@@ -836,6 +839,7 @@ class Telephone(object):
 
     def _on_call_started(self):
         """Called when a call becomes active. Start the SCO audio bridges."""
+        self._disable_wifi_for_call()
         self.uplink_bridge.start()
         self.downlink_bridge.start()
 
@@ -843,8 +847,60 @@ class Telephone(object):
         """Called when an active call ends. Stop the SCO audio bridges."""
         self.uplink_bridge.stop()
         self.downlink_bridge.stop()
+        self._restore_wifi_after_call()
         if not self.receiver_down:
             self.start_dial_tone()
+
+    def _run_command_with_sudo_fallback(self, command):
+        try:
+            if call(command) == 0:
+                return True
+            return call(['sudo'] + command) == 0
+        except OSError:
+            return False
+
+    def _is_wifi_enabled(self):
+        operstate_path = Path('/sys/class/net') / self._wifi_iface / 'operstate'
+        try:
+            state = operstate_path.read_text().strip().lower()
+            return state != 'down'
+        except OSError:
+            return None
+
+    def _set_wifi_enabled(self, enabled):
+        rfkill_cmd = ['rfkill', 'unblock' if enabled else 'block', 'wifi']
+        if self._run_command_with_sudo_fallback(rfkill_cmd):
+            return True
+
+        ip_cmd = ['ip', 'link', 'set', self._wifi_iface, 'up' if enabled else 'down']
+        return self._run_command_with_sudo_fallback(ip_cmd)
+
+    def _disable_wifi_for_call(self):
+        with self._wifi_lock:
+            if self._wifi_restore_needed:
+                return
+
+            wifi_enabled = self._is_wifi_enabled()
+            if wifi_enabled is False:
+                print("[WIFI] %s already disabled before call" % self._wifi_iface)
+                return
+
+            if self._set_wifi_enabled(False):
+                self._wifi_restore_needed = True
+                print("[WIFI] Disabled %s for call" % self._wifi_iface)
+            else:
+                print("[WIFI] Failed to disable %s for call" % self._wifi_iface)
+
+    def _restore_wifi_after_call(self):
+        with self._wifi_lock:
+            if not self._wifi_restore_needed:
+                return
+
+            if self._set_wifi_enabled(True):
+                self._wifi_restore_needed = False
+                print("[WIFI] Restored %s after call" % self._wifi_iface)
+            else:
+                print("[WIFI] Failed to restore %s after call" % self._wifi_iface)
 
     def _on_incoming_call_changed(self, is_incoming):
         """Called from the PhoneManager monitor thread when incoming call state changes."""
@@ -1042,6 +1098,7 @@ class Telephone(object):
         self.finish = True
         self.uplink_bridge.stop()
         self.downlink_bridge.stop()
+        self._restore_wifi_after_call()
         self._stop_ringing()
         self._set_ringer(False)
         self.rotary_dial.stop()
