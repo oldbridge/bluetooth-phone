@@ -16,7 +16,7 @@ import time
 import wave
 import queue
 from threading import Event, Lock, Thread
-from subprocess import call
+import subprocess
 
 
 class PhonebookLoader(yaml.SafeLoader):
@@ -245,7 +245,15 @@ class AudioPlayer(object):
 
 
 class UplinkBridge(object):
-    """Capture USB mic and stream directly to BlueALSA SCO from Python."""
+    """Capture USB mic and pipe to BlueALSA SCO via arecord | aplay subprocesses.
+
+    Using subprocesses instead of a Python-level ALSA loop eliminates GIL
+    contention and prevents indefinite stalls caused by blocking PCM writes
+    when the Bluetooth SCO buffer is congested (critical on low-power hardware).
+    """
+
+    _BACKOFF_INITIAL = 0.2
+    _BACKOFF_MAX = 8.0
 
     def __init__(self, bt_device, capture_device='plughw:Device,0', sample_rate=8000, channels=1, period_frames=160):
         self.bt_device = bt_device
@@ -257,6 +265,9 @@ class UplinkBridge(object):
         self._stop_event = Event()
         self._thread = None
         self._lock = Lock()
+        self._proc_lock = Lock()
+        self._rec_proc = None
+        self._play_proc = None
 
     @property
     def is_running(self):
@@ -270,13 +281,14 @@ class UplinkBridge(object):
             self._stop_event.clear()
             self._thread = Thread(target=self._run, daemon=True)
             thread = self._thread
-        print("[UPLINK] Starting Python ALSA bridge")
+        print("[UPLINK] Starting subprocess ALSA bridge")
         thread.start()
 
     def stop(self):
+        self._stop_event.set()
+        self._terminate_procs()
         with self._lock:
             thread = self._thread
-            self._stop_event.set()
         if thread is not None and thread.is_alive():
             thread.join(timeout=2)
         if thread is not None and thread.is_alive():
@@ -285,67 +297,103 @@ class UplinkBridge(object):
         with self._lock:
             if self._thread is thread:
                 self._thread = None
-        print("[UPLINK] Stopped Python ALSA bridge")
+        print("[UPLINK] Stopped subprocess ALSA bridge")
 
-    def _create_pcm(self, pcm_type, device):
-        # For uplink stability we keep both ends in blocking mode.
-        # Non-blocking capture on USB mics can create bursty reads and audible chopping.
-        mode = alsaaudio.PCM_NORMAL
-        return alsaaudio.PCM(
-            type=pcm_type,
-            mode=mode,
-            device=device,
-            channels=self.channels,
-            rate=self.sample_rate,
-            format=alsaaudio.PCM_FORMAT_S16_LE,
-            periodsize=self.period_frames,
-        )
-
-    def _wait_for_playback_ready(self):
-        # The BlueALSA PCM can exist before audio transfer starts. Probe until writes succeed.
-        silence = b'\x00\x00' * (self.period_frames * self.channels)
-        while not self._stop_event.is_set():
-            playback = None
+    def _terminate_procs(self):
+        with self._proc_lock:
+            rec, play = self._rec_proc, self._play_proc
+            self._rec_proc = None
+            self._play_proc = None
+        for proc in (rec, play):
+            if proc is None:
+                continue
+            if proc.poll() is None:
+                proc.terminate()
             try:
-                playback = self._create_pcm(alsaaudio.PCM_PLAYBACK, self.playback_device)
-                playback.write(silence)
-                print("[UPLINK] BlueALSA playback ready")
-                return playback
+                proc.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+
+    def _wait_for_sco_available(self):
+        """Return True once the BlueALSA SCO PCM device can be opened, False if stopped."""
+        while not self._stop_event.is_set():
+            try:
+                pcm = alsaaudio.PCM(
+                    type=alsaaudio.PCM_PLAYBACK,
+                    mode=alsaaudio.PCM_NONBLOCK,
+                    device=self.playback_device,
+                    channels=self.channels,
+                    rate=self.sample_rate,
+                    format=alsaaudio.PCM_FORMAT_S16_LE,
+                    periodsize=self.period_frames,
+                )
+                del pcm
+                print("[UPLINK] BlueALSA SCO available")
+                return True
             except alsaaudio.ALSAAudioError:
-                if playback is not None:
-                    del playback
                 time.sleep(0.2)
-        return None
+        return False
 
     def _run(self):
+        backoff = self._BACKOFF_INITIAL
         while not self._stop_event.is_set():
-            playback = self._wait_for_playback_ready()
-            if playback is None:
-                return
+            if not self._wait_for_sco_available():
+                break
 
-            capture = None
+            rec_proc = None
+            play_proc = None
             try:
-                capture = self._create_pcm(alsaaudio.PCM_CAPTURE, self.capture_device)
+                rec_proc = subprocess.Popen(
+                    [
+                        'arecord',
+                        '-D', self.capture_device,
+                        '-f', 'S16_LE',
+                        '-r', str(self.sample_rate),
+                        '-c', str(self.channels),
+                    ],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                )
+                play_proc = subprocess.Popen(
+                    [
+                        'aplay',
+                        '-D', self.playback_device,
+                        '-f', 'S16_LE',
+                        '-r', str(self.sample_rate),
+                        '-c', str(self.channels),
+                    ],
+                    stdin=rec_proc.stdout,
+                    stderr=subprocess.DEVNULL,
+                )
+                # Close parent copy so rec_proc receives SIGPIPE if play_proc exits.
+                rec_proc.stdout.close()
+
+                with self._proc_lock:
+                    self._rec_proc = rec_proc
+                    self._play_proc = play_proc
+
+                backoff = self._BACKOFF_INITIAL
                 while not self._stop_event.is_set():
-                    frames, data = capture.read()
-                    if frames <= 0 or not data:
-                        # Blocking capture should rarely produce empty frames,
-                        # but keep a tiny backoff for transient hardware glitches.
-                        time.sleep(0.002)
-                        continue
-                    playback.write(data)
-            except alsaaudio.ALSAAudioError as exc:
-                print("[UPLINK] ALSA stream reset (%s), reconnecting..." % exc)
-                time.sleep(0.2)
+                    if play_proc.poll() is not None:
+                        print("[UPLINK] aplay exited (rc=%d), reconnecting..." % play_proc.returncode)
+                        break
+                    if rec_proc.poll() is not None:
+                        print("[UPLINK] arecord exited (rc=%d), reconnecting..." % rec_proc.returncode)
+                        break
+                    time.sleep(0.3)
+
             except Exception as exc:
-                # Keep bridge alive on unexpected runtime failures.
-                print("[UPLINK] Unexpected bridge error (%s), reconnecting..." % exc)
-                time.sleep(0.5)
+                print("[UPLINK] Bridge error (%s), reconnecting..." % exc)
+
             finally:
-                if capture is not None:
-                    del capture
-                if playback is not None:
-                    del playback
+                self._terminate_procs()
+                rec_proc = None
+                play_proc = None
+                if not self._stop_event.is_set():
+                    time.sleep(backoff)
+                    backoff = min(backoff * 2, self._BACKOFF_MAX)
+
         with self._lock:
             self._thread = None
 
@@ -853,9 +901,9 @@ class Telephone(object):
 
     def _run_command_with_sudo_fallback(self, command):
         try:
-            if call(command) == 0:
+            if subprocess.call(command) == 0:
                 return True
-            return call(['sudo'] + command) == 0
+            return subprocess.call(['sudo'] + command) == 0
         except OSError:
             return False
 
@@ -1074,7 +1122,7 @@ class Telephone(object):
                         print("Turning system off")
                         self.start_file(self.asset_dir / "turnoff.wav")
                         time.sleep(6)
-                        call("sudo shutdown -h now", shell=True)
+                        subprocess.call("sudo shutdown -h now", shell=True)
                     elif c == 5:
                         self.ringer_test()
                     elif 1 <= c <= len(self.phonebook):
