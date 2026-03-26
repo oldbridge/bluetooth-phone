@@ -622,6 +622,8 @@ class PhoneManager(object):
         self.on_incoming_call_changed = None
         self.on_call_started = None
         self.on_call_ended = None
+        self.on_device_availability_changed = None
+        self._connected_device_present = False
         self.available = False
 
         logging.getLogger("dbus.proxies").setLevel(logging.WARNING)
@@ -649,6 +651,7 @@ class PhoneManager(object):
         has_call, has_incoming = self._get_call_info()
         self.call_in_progress = has_call
         self.incoming_call = has_incoming
+        self._connected_device_present = self.has_paired_device(require_connected=True)
         self._stop_event = Event()
         self._monitor_thread = Thread(target=self._monitor_calls, daemon=True)
         self._monitor_thread.start()
@@ -835,11 +838,20 @@ class PhoneManager(object):
         if self.on_incoming_call_changed is not None:
             self.on_incoming_call_changed(is_incoming)
 
+    def _poll_device_availability(self):
+        now_available = self.has_paired_device(require_connected=True)
+        if now_available != self._connected_device_present:
+            self._connected_device_present = now_available
+            print("[BT] Device availability changed: %s" % now_available)
+            if self.on_device_availability_changed is not None:
+                self.on_device_availability_changed(now_available)
+
     def _monitor_calls(self):
         while not self._stop_event.wait(self.POLL_INTERVAL_SECONDS):
             has_call, has_incoming = self._get_call_info()
             self._set_call_state(has_call)
             self._set_incoming_state(has_incoming)
+            self._poll_device_availability()
 
     def end_call(self):
         """
@@ -1049,9 +1061,7 @@ class PhoneManager(object):
 
                 if not paired or blocked:
                     continue
-                # BlueZ Connected can be false while oFono/HFP is still usable.
-                # If oFono already exposes a modem, accept paired devices.
-                if require_connected and not connected and not self.modem_path:
+                if require_connected and not connected:
                     continue
 
                 found = True
@@ -1113,6 +1123,7 @@ class Telephone(object):
         self.phone_manager.on_incoming_call_changed = self._on_incoming_call_changed
         self.phone_manager.on_call_started = self._on_call_started
         self.phone_manager.on_call_ended = self._on_call_ended
+        self.phone_manager.on_device_availability_changed = self._on_device_availability_changed
         self.rotary_dial = RotaryDial(
             num_pin,
             self.number_q,
@@ -1266,6 +1277,17 @@ class Telephone(object):
                 print("[WIFI] Restored %s after call" % self._wifi_iface)
             else:
                 print("[WIFI] Failed to restore %s after call" % self._wifi_iface)
+
+    def _on_device_availability_changed(self, is_available):
+        """Called when a BT device connects or disconnects while the receiver is idle."""
+        if self.receiver_down or self.phone_manager.call_in_progress:
+            return
+        if is_available:
+            print("[BT] Device connected while receiver up, switching to dial tone")
+            self.start_dial_tone()
+        else:
+            print("[BT] Device disconnected while receiver up, switching to busy tone")
+            self.start_busy_tone()
 
     def _on_incoming_call_changed(self, is_incoming):
         """Called from the PhoneManager monitor thread when incoming call state changes."""
