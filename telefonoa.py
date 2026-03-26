@@ -449,6 +449,8 @@ class PhoneManager(object):
         self.call_in_progress = False
         self.incoming_call = False
         self.on_incoming_call_changed = None
+        self.on_call_started = None
+        self.on_call_ended = None
         self.available = False
 
         logging.getLogger("dbus.proxies").setLevel(logging.WARNING)
@@ -511,8 +513,12 @@ class PhoneManager(object):
         self.call_in_progress = in_progress
         if in_progress:
             print("Call in progress!")
+            if self.on_call_started is not None:
+                self.on_call_started()
         else:
             print("Call ended!")
+            if self.on_call_ended is not None:
+                self.on_call_ended()
 
     def _set_incoming_state(self, is_incoming):
         if is_incoming == self.incoming_call:
@@ -709,6 +715,8 @@ class Telephone(object):
         self._ringer_test_active = Event()
         self._ring_thread = None
         self.phone_manager.on_incoming_call_changed = self._on_incoming_call_changed
+        self.phone_manager.on_call_started = self._on_call_started
+        self.phone_manager.on_call_ended = self._on_call_ended
         self.rotary_dial = RotaryDial(num_pin, self.number_q)
         self.finish = False
         self._last_receiver_raw_state = None
@@ -762,6 +770,18 @@ class Telephone(object):
         self._manual_number = ''
         self._last_digit_at = None
 
+    def _on_call_started(self):
+        """Called when a call becomes active. Start the SCO audio bridges."""
+        self.uplink_bridge.start()
+        self.downlink_bridge.start()
+
+    def _on_call_ended(self):
+        """Called when an active call ends. Stop the SCO audio bridges."""
+        self.uplink_bridge.stop()
+        self.downlink_bridge.stop()
+        if not self.receiver_down:
+            self.start_dial_tone()
+
     def _on_incoming_call_changed(self, is_incoming):
         """Called from the PhoneManager monitor thread when incoming call state changes."""
         if self._ringer_test_active.is_set():
@@ -811,11 +831,13 @@ class Telephone(object):
             self.phone_manager.end_call()
             self.stop_file()
             return
-        self.uplink_bridge.start()
-        self.downlink_bridge.start()
         self._stop_ringing()
         if self.phone_manager.incoming_call:
             self.phone_manager.answer_call()
+            return
+        if self.phone_manager.call_in_progress:
+            # A call was placed while the receiver was down (shortcut dial).
+            # Bridges are already running via on_call_started; nothing more to do.
             return
         has_paired_device = self.phone_manager.has_paired_device(require_connected=True)
         if not self.phone_manager.available or not has_paired_device:
