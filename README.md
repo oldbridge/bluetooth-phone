@@ -104,6 +104,31 @@ If the returned array is empty, `oFono` is running but no modem is ready yet.
   - If handset is down, the ringer pin pattern is used (1s ON / 4s OFF)
   - Lifting handset answers the incoming call
 
+## Recent changes: dynamic Bluetooth device for SCO bridges
+
+The SCO audio bridges no longer use a hardcoded Bluetooth MAC address.
+
+What changed:
+
+- `UplinkBridge` and `DownlinkBridge` now accept a dynamic `bt_device` and can be updated at runtime.
+- `PhoneManager` now exposes `get_bt_device_address()`, which resolves the currently active device from the oFono modem context.
+- `Telephone` initializes both bridges using the modem-derived Bluetooth device.
+- On call start, `Telephone` refreshes the bridge device again before starting downlink/uplink, so bridge routing follows the currently connected modem/device.
+
+Resolution logic used by `get_bt_device_address()`:
+
+1. Try reading `org.bluez.Device1.Address` over D-Bus for the modem's BlueZ device path.
+2. If D-Bus lookup fails, parse the address from path suffix format like `.../dev_XX_XX_XX_XX_XX_XX`.
+3. If no valid address can be resolved, bridges are kept unconfigured and will not start.
+
+Runtime notes:
+
+- You should now see logs such as:
+  - `[BT] Using modem Bluetooth device AA:BB:CC:DD:EE:FF`
+  - `[BT] Bridge device set to AA:BB:CC:DD:EE:FF`
+- If no modem device is available yet, startup/call logs indicate that and bridge startup is skipped until a device can be resolved.
+- This change removes the need to edit source code when the paired phone/device MAC changes.
+
 ### Number handling
 
 Before dialing, numbers are normalized to digits plus optional leading `+`.
