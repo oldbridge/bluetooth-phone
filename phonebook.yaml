@@ -1,5 +1,31 @@
+config:
+  pins:
+    receiver: 13
+    rotary: 19
+    ringer: 18
+
+  rotary:
+    pulse_threshold_seconds: 0.2
+    debounce_seconds: 0.09
+
+  call:
+    disable_wifi_during_call: true
+
+  actions:
+    ringer_test_number: 5
+    shutdown_number: 9
+
+  announcements:
+    ready: ready.wav
+    not_connected: not_connected.wav
+    format_incorrect: format_incorrect.wav
+    turnoff: turnoff.wav
+
 # Add up to 8 numbers corresponding for number 1-8 when hooked
-- name: Number 1
-  number: 123456789
-- name: Number 2
-  number: 987654321
+phonebook:
+  - name: Number 1
+    number: +xxxxxxxxx
+  - name: Number 2
+    number: +xxxxxxx
+  - name: Number 3
+    number: +3xxxxxxxxxxx

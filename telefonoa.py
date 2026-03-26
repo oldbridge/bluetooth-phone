@@ -20,6 +20,32 @@ from threading import Event, Lock, Thread
 import subprocess
 
 
+DEFAULT_CONFIG = {
+    'pins': {
+        'receiver': 13,
+        'rotary': 19,
+        'ringer': 18,
+    },
+    'rotary': {
+        'pulse_threshold_seconds': 0.2,
+        'debounce_seconds': 0.09,
+    },
+    'call': {
+        'disable_wifi_during_call': True,
+    },
+    'actions': {
+        'ringer_test_number': 5,
+        'shutdown_number': 9,
+    },
+    'announcements': {
+        'ready': 'ready.wav',
+        'not_connected': 'not_connected.wav',
+        'format_incorrect': 'format_incorrect.wav',
+        'turnoff': 'turnoff.wav',
+    },
+}
+
+
 class PhonebookLoader(yaml.SafeLoader):
     """YAML loader keeping phone numbers like +34... as strings."""
 
@@ -31,20 +57,72 @@ for key, resolvers in list(PhonebookLoader.yaml_implicit_resolvers.items()):
     ]
 
 
+def load_telephone_config(config_path):
+    """Load runtime config + phonebook from YAML.
+
+    Supports both the new mapping format:
+      config: {...}
+      phonebook: [...]
+    and the legacy phonebook-only list format.
+    """
+    config = {
+        'pins': dict(DEFAULT_CONFIG['pins']),
+        'rotary': dict(DEFAULT_CONFIG['rotary']),
+        'call': dict(DEFAULT_CONFIG['call']),
+        'actions': dict(DEFAULT_CONFIG['actions']),
+        'announcements': dict(DEFAULT_CONFIG['announcements']),
+    }
+
+    try:
+        with Path(config_path).open('r') as stream:
+            loaded = yaml.load(stream, Loader=PhonebookLoader)
+    except OSError as exc:
+        print("Cannot read config file %s: %s" % (config_path, exc))
+        return config, []
+    except yaml.YAMLError as exc:
+        print("Invalid YAML in %s: %s" % (config_path, exc))
+        return config, []
+
+    if loaded is None:
+        return config, []
+
+    if isinstance(loaded, list):
+        # Backward compatibility with legacy phonebook-only format.
+        return config, loaded
+
+    if not isinstance(loaded, dict):
+        print("Unexpected config format in %s, using defaults" % config_path)
+        return config, []
+
+    loaded_config = loaded.get('config', {})
+    if isinstance(loaded_config, dict):
+        for section in ('pins', 'rotary', 'call', 'actions', 'announcements'):
+            section_data = loaded_config.get(section, {})
+            if isinstance(section_data, dict):
+                config[section].update(section_data)
+
+    phonebook = loaded.get('phonebook', [])
+    if not isinstance(phonebook, list):
+        print("Invalid phonebook section in %s, using empty phonebook" % config_path)
+        phonebook = []
+
+    return config, phonebook
+
+
 class RotaryDial(Thread):
     """
     Thread class reading the dialed values and putting them into a thread queue
     """
 
-    def __init__(self, ns_pin, number_queue):
+    def __init__(self, ns_pin, number_queue, pulse_threshold=0.2, debounce_seconds=0.09):
         super().__init__(daemon=True)
         self.pin = ns_pin
         self.number_q = number_queue
         GPIO.setup(self.pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
         self.value = 0
-        self.pulse_threshold = 0.2
+        self.pulse_threshold = pulse_threshold
         self.poll_interval = 0.002
-        self.debounce_seconds = 0.09
+        self.debounce_seconds = debounce_seconds
         self._stop_event = Event()
         self._value_lock = Lock()
         self._last_pulse_at = 0.0
@@ -526,12 +604,15 @@ class PhoneManager(object):
     POLL_INTERVAL_SECONDS = 0.5
     DBUS_TIMEOUT_SECONDS = 8
 
-    def __init__(self, audio_player, asset_dir):
+    def __init__(self, audio_player, asset_dir, announcements=None):
         """
         The PhoneManager class manages the calls and the communication with the ofono service.
         """
         self.audio_player = audio_player
         self.asset_dir = Path(asset_dir)
+        self.announcements = dict(DEFAULT_CONFIG['announcements'])
+        if isinstance(announcements, dict):
+            self.announcements.update(announcements)
         self.bus = dbus.SystemBus()
         self.voice_call_manager = None
         self.modem_path = None
@@ -680,8 +761,9 @@ class PhoneManager(object):
         else:
             print(str(exc))
 
-    def _asset_path(self, filename):
-        return self.asset_dir / filename
+    def _announcement_path(self, key, default_filename):
+        filename = self.announcements.get(key, default_filename)
+        return self.asset_dir / str(filename)
 
     def _get_call_info(self):
         """Returns (has_any_call, has_incoming_call)."""
@@ -877,13 +959,13 @@ class PhoneManager(object):
         """
         if not self.available or self.voice_call_manager is None:
             print("Call system not available")
-            self.audio_player.play(self._asset_path("not_connected.wav"))
+            self.audio_player.play(self._announcement_path('not_connected', 'not_connected.wav'))
             return
 
         normalized_number = self._normalize_number(number)
         if not normalized_number:
             print("Invalid dialed number format!")
-            self.audio_player.play(self._asset_path("format_incorrect.wav"))
+            self.audio_player.play(self._announcement_path('format_incorrect', 'format_incorrect.wav'))
             return
 
         candidates = self._dial_candidates(normalized_number)
@@ -912,7 +994,7 @@ class PhoneManager(object):
                             if e.get_dbus_name() != 'org.ofono.Error.InvalidFormat':
                                 raise
                 print("Invalid dialed number format!")
-                self.audio_player.play(self._asset_path("format_incorrect.wav"))
+                self.audio_player.play(self._announcement_path('format_incorrect', 'format_incorrect.wav'))
                 return
             except dbus.exceptions.DBusException as e:
                 last_error = e
@@ -927,7 +1009,7 @@ class PhoneManager(object):
         name = last_error.get_dbus_name()
         if name == 'org.freedesktop.DBus.Error.UnknownMethod':
             print("Ofono not running")
-            self.audio_player.play(self._asset_path("not_connected.wav"))
+            self.audio_player.play(self._announcement_path('not_connected', 'not_connected.wav'))
         else:
             print(name)
 
@@ -990,16 +1072,28 @@ class Telephone(object):
     """
     Main Telephone class containing everything required for the Bluetooth telephone to work.
     """
-    def __init__(self, num_pin, receiver_pin):
+    def __init__(self, num_pin, receiver_pin, config=None, phonebook=None):
         GPIO.setmode(GPIO.BCM)
+        config = config or {}
         self.asset_dir = Path(__file__).resolve().parent
         self.receiver_pin = receiver_pin
-        self.ringer_pin = 18
+        configured_pins = config.get('pins', {}) if isinstance(config.get('pins', {}), dict) else {}
+        rotary_config = config.get('rotary', {}) if isinstance(config.get('rotary', {}), dict) else {}
+        call_config = config.get('call', {}) if isinstance(config.get('call', {}), dict) else {}
+        actions_config = config.get('actions', {}) if isinstance(config.get('actions', {}), dict) else {}
+        configured_announcements = config.get('announcements', {}) if isinstance(config.get('announcements', {}), dict) else {}
+
+        self.ringer_pin = int(configured_pins.get('ringer', DEFAULT_CONFIG['pins']['ringer']))
         GPIO.setup(self.receiver_pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
         GPIO.setup(self.ringer_pin, GPIO.OUT, initial=GPIO.HIGH)
         self.number_q = queue.Queue()
+        self.announcements = dict(DEFAULT_CONFIG['announcements'])
+        self.announcements.update(configured_announcements)
+        self._wifi_disable_during_call = bool(call_config.get('disable_wifi_during_call', True))
+        self._ringer_test_number = int(actions_config.get('ringer_test_number', DEFAULT_CONFIG['actions']['ringer_test_number']))
+        self._shutdown_number = int(actions_config.get('shutdown_number', DEFAULT_CONFIG['actions']['shutdown_number']))
         self.audio_player = AudioPlayer()
-        self.phone_manager = PhoneManager(self.audio_player, self.asset_dir)
+        self.phone_manager = PhoneManager(self.audio_player, self.asset_dir, announcements=self.announcements)
         modem_bt_device = self.phone_manager.get_bt_device_address()
         if modem_bt_device:
             print("[BT] Using Bluetooth device %s" % modem_bt_device)
@@ -1019,7 +1113,12 @@ class Telephone(object):
         self.phone_manager.on_incoming_call_changed = self._on_incoming_call_changed
         self.phone_manager.on_call_started = self._on_call_started
         self.phone_manager.on_call_ended = self._on_call_ended
-        self.rotary_dial = RotaryDial(num_pin, self.number_q)
+        self.rotary_dial = RotaryDial(
+            num_pin,
+            self.number_q,
+            pulse_threshold=float(rotary_config.get('pulse_threshold_seconds', DEFAULT_CONFIG['rotary']['pulse_threshold_seconds'])),
+            debounce_seconds=float(rotary_config.get('debounce_seconds', DEFAULT_CONFIG['rotary']['debounce_seconds'])),
+        )
         self.finish = False
         self._last_receiver_raw_state = None
         self.receiver_down = self._is_receiver_down()
@@ -1032,9 +1131,8 @@ class Telephone(object):
         self._wifi_restore_needed = False
         self._wifi_lock = Lock()
 
-        # Load fast_dial numbers
-        with (self.asset_dir / "phonebook.yaml").open('r') as stream:
-            self.phonebook = yaml.load(stream, Loader=PhonebookLoader) or []
+        # Fast dial entries are loaded externally from the merged config file.
+        self.phonebook = phonebook if isinstance(phonebook, list) else []
 
         print(self.phonebook)
 
@@ -1057,7 +1155,7 @@ class Telephone(object):
         self.rotary_dial.start()
 
         # Anounce ready
-        self.start_file(self.asset_dir / "ready.wav")
+        self.start_file(self.asset_dir / str(self.announcements.get('ready', 'ready.wav')))
 
     def _is_receiver_down(self):
         raw_state = GPIO.input(self.receiver_pin)
@@ -1105,14 +1203,16 @@ class Telephone(object):
         channel, resulting in several seconds of delay at call start.
         """
         self._refresh_bridge_bt_device()
-        self._disable_wifi_for_call()
+        if self._wifi_disable_during_call:
+            self._disable_wifi_for_call()
         self.downlink_bridge.start()
 
     def _on_call_ended(self):
         """Called when an active call ends. Stop the SCO audio bridges."""
         self.uplink_bridge.stop()
         self.downlink_bridge.stop()
-        self._restore_wifi_after_call()
+        if self._wifi_disable_during_call:
+            self._restore_wifi_after_call()
         if not self.receiver_down:
             self.start_dial_tone()
 
@@ -1335,12 +1435,12 @@ class Telephone(object):
                 try:
                     c = self.number_q.get(timeout=self._queue_timeout)
                     print("Selected %d" % c)
-                    if c == 9:
+                    if c == self._shutdown_number:
                         print("Turning system off")
-                        self.start_file(self.asset_dir / "turnoff.wav")
+                        self.start_file(self.asset_dir / str(self.announcements.get('turnoff', 'turnoff.wav')))
                         time.sleep(6)
                         subprocess.call("sudo shutdown -h now", shell=True)
-                    elif c == 5:
+                    elif c == self._ringer_test_number:
                         self.ringer_test()
                     elif 1 <= c <= len(self.phonebook):
                         if self.phone_manager.call_in_progress or self.phone_manager.incoming_call:
@@ -1351,7 +1451,7 @@ class Telephone(object):
                         shortcut_number = str(self.phonebook[c - 1].get('number', '')).strip()
                         if not shortcut_number:
                             print("Invalid phonebook number for shortcut %d" % c)
-                            self.start_file(self.asset_dir / "format_incorrect.wav")
+                            self.start_file(self.asset_dir / str(self.announcements.get('format_incorrect', 'format_incorrect.wav')))
                             continue
                         print(shortcut_number)
                         time.sleep(4)
@@ -1363,7 +1463,8 @@ class Telephone(object):
         self.finish = True
         self.uplink_bridge.stop()
         self.downlink_bridge.stop()
-        self._restore_wifi_after_call()
+        if self._wifi_disable_during_call:
+            self._restore_wifi_after_call()
         self._stop_ringing()
         self._set_ringer(False)
         self.rotary_dial.stop()
@@ -1376,10 +1477,13 @@ class Telephone(object):
 
 
 if __name__ == '__main__':
-    HOERER_PIN = 13
-    NS_PIN = 19
+    asset_dir = Path(__file__).resolve().parent
+    runtime_config, phonebook = load_telephone_config(asset_dir / 'phonebook.yaml')
+    pins = runtime_config.get('pins', {})
+    hoerer_pin = int(pins.get('receiver', DEFAULT_CONFIG['pins']['receiver']))
+    ns_pin = int(pins.get('rotary', DEFAULT_CONFIG['pins']['rotary']))
 
-    t = Telephone(NS_PIN, HOERER_PIN)
+    t = Telephone(ns_pin, hoerer_pin, config=runtime_config, phonebook=phonebook)
     try:
         t.dialing_handler()
     except KeyboardInterrupt:
