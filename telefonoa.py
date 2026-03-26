@@ -339,6 +339,102 @@ class UplinkBridge(object):
             self._thread = None
 
 
+class DownlinkBridge(object):
+    """Capture BlueALSA SCO and play to USB audio device (phone speaker)."""
+
+    def __init__(self, bt_device, playback_device='plughw:Device,0', sample_rate=8000, channels=1, period_frames=120, on_sco_ready=None):
+        self.bt_device = bt_device
+        self.capture_device = "bluealsa:DEV=%s,PROFILE=sco" % bt_device
+        self.playback_device = playback_device
+        self.sample_rate = sample_rate
+        self.channels = channels
+        self.period_frames = period_frames
+        self.on_sco_ready = on_sco_ready
+        self._stop_event = Event()
+        self._thread = None
+        self._lock = Lock()
+
+    @property
+    def is_running(self):
+        with self._lock:
+            return self._thread is not None and self._thread.is_alive()
+
+    def start(self):
+        with self._lock:
+            if self._thread is not None and self._thread.is_alive():
+                return
+            self._stop_event.clear()
+            self._thread = Thread(target=self._run, daemon=True)
+            thread = self._thread
+        print("[DOWNLINK] Starting Python ALSA bridge")
+        thread.start()
+
+    def stop(self):
+        with self._lock:
+            thread = self._thread
+            self._stop_event.set()
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=2)
+        with self._lock:
+            if self._thread is thread:
+                self._thread = None
+        print("[DOWNLINK] Stopped Python ALSA bridge")
+
+    def _create_pcm(self, pcm_type, device):
+        mode = alsaaudio.PCM_NONBLOCK if pcm_type == alsaaudio.PCM_CAPTURE else alsaaudio.PCM_NORMAL
+        return alsaaudio.PCM(
+            type=pcm_type,
+            mode=mode,
+            device=device,
+            channels=self.channels,
+            rate=self.sample_rate,
+            format=alsaaudio.PCM_FORMAT_S16_LE,
+            periodsize=self.period_frames,
+        )
+
+    def _wait_for_capture_ready(self):
+        while not self._stop_event.is_set():
+            capture = None
+            try:
+                capture = self._create_pcm(alsaaudio.PCM_CAPTURE, self.capture_device)
+                print("[DOWNLINK] BlueALSA capture ready")
+                return capture
+            except alsaaudio.ALSAAudioError:
+                if capture is not None:
+                    del capture
+                time.sleep(0.2)
+        return None
+
+    def _run(self):
+        while not self._stop_event.is_set():
+            capture = self._wait_for_capture_ready()
+            if capture is None:
+                return
+
+            if self.on_sco_ready is not None:
+                self.on_sco_ready()
+
+            playback = None
+            try:
+                playback = self._create_pcm(alsaaudio.PCM_PLAYBACK, self.playback_device)
+                while not self._stop_event.is_set():
+                    frames, data = capture.read()
+                    if frames <= 0 or not data:
+                        time.sleep(0.01)
+                        continue
+                    playback.write(data)
+            except alsaaudio.ALSAAudioError as exc:
+                print("[DOWNLINK] ALSA stream reset (%s), reconnecting..." % exc)
+                time.sleep(0.2)
+            finally:
+                if capture is not None:
+                    del capture
+                if playback is not None:
+                    del playback
+        with self._lock:
+            self._thread = None
+
+
 class PhoneManager(object):
     POLL_INTERVAL_SECONDS = 0.5
 
@@ -601,6 +697,11 @@ class Telephone(object):
         self.number_q = queue.Queue()
         self.audio_player = AudioPlayer()
         self.uplink_bridge = UplinkBridge(bt_device='40:D1:60:4F:C2:15', capture_device='plughw:Device,0')
+        self.downlink_bridge = DownlinkBridge(
+            bt_device='40:D1:60:4F:C2:15',
+            playback_device='plughw:Device,0',
+            on_sco_ready=self.audio_player.stop,
+        )
         self.phone_manager = PhoneManager(self.audio_player, self.asset_dir)
         self._ring_stop_event = Event()
         self._ring_lock = Lock()
@@ -702,6 +803,7 @@ class Telephone(object):
         print("[HOOK] Applying state: receiver_%s" % ('down' if self.receiver_down else 'up'))
         if self.receiver_down:
             self.uplink_bridge.stop()
+            self.downlink_bridge.stop()
             self._clear_manual_dial_state()
             self._stop_ringing()
             # Always attempt hangup when placing the handset down. Relying on
@@ -710,6 +812,7 @@ class Telephone(object):
             self.stop_file()
             return
         self.uplink_bridge.start()
+        self.downlink_bridge.start()
         self._stop_ringing()
         if self.phone_manager.incoming_call:
             self.phone_manager.answer_call()
@@ -848,6 +951,7 @@ class Telephone(object):
     def close(self):
         self.finish = True
         self.uplink_bridge.stop()
+        self.downlink_bridge.stop()
         self._stop_ringing()
         self._set_ringer(False)
         self.rotary_dial.stop()
