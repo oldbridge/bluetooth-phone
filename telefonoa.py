@@ -247,7 +247,7 @@ class AudioPlayer(object):
 class UplinkBridge(object):
     """Capture USB mic and stream directly to BlueALSA SCO from Python."""
 
-    def __init__(self, bt_device, capture_device='plughw:Device,0', sample_rate=8000, channels=1, period_frames=120):
+    def __init__(self, bt_device, capture_device='plughw:Device,0', sample_rate=8000, channels=1, period_frames=160):
         self.bt_device = bt_device
         self.capture_device = capture_device
         self.playback_device = "bluealsa:DEV=%s,PROFILE=sco" % bt_device
@@ -279,13 +279,18 @@ class UplinkBridge(object):
             self._stop_event.set()
         if thread is not None and thread.is_alive():
             thread.join(timeout=2)
+        if thread is not None and thread.is_alive():
+            print("[UPLINK] Bridge thread did not stop within timeout")
+            return
         with self._lock:
             if self._thread is thread:
                 self._thread = None
         print("[UPLINK] Stopped Python ALSA bridge")
 
     def _create_pcm(self, pcm_type, device):
-        mode = alsaaudio.PCM_NONBLOCK if pcm_type == alsaaudio.PCM_CAPTURE else alsaaudio.PCM_NORMAL
+        # For uplink stability we keep both ends in blocking mode.
+        # Non-blocking capture on USB mics can create bursty reads and audible chopping.
+        mode = alsaaudio.PCM_NORMAL
         return alsaaudio.PCM(
             type=pcm_type,
             mode=mode,
@@ -324,12 +329,18 @@ class UplinkBridge(object):
                 while not self._stop_event.is_set():
                     frames, data = capture.read()
                     if frames <= 0 or not data:
-                        time.sleep(0.01)
+                        # Blocking capture should rarely produce empty frames,
+                        # but keep a tiny backoff for transient hardware glitches.
+                        time.sleep(0.002)
                         continue
                     playback.write(data)
             except alsaaudio.ALSAAudioError as exc:
                 print("[UPLINK] ALSA stream reset (%s), reconnecting..." % exc)
                 time.sleep(0.2)
+            except Exception as exc:
+                # Keep bridge alive on unexpected runtime failures.
+                print("[UPLINK] Unexpected bridge error (%s), reconnecting..." % exc)
+                time.sleep(0.5)
             finally:
                 if capture is not None:
                     del capture
@@ -375,6 +386,9 @@ class DownlinkBridge(object):
             self._stop_event.set()
         if thread is not None and thread.is_alive():
             thread.join(timeout=2)
+        if thread is not None and thread.is_alive():
+            print("[DOWNLINK] Bridge thread did not stop within timeout")
+            return
         with self._lock:
             if self._thread is thread:
                 self._thread = None
