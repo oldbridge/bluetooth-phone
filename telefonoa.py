@@ -307,6 +307,13 @@ class UplinkBridge(object):
         for proc in (rec, play):
             if proc is None:
                 continue
+            # Close stdin so aplay gets EOF and exits cleanly if arecord hasn't
+            # taken over the write-end of the pipe yet (early termination path).
+            try:
+                if proc.stdin is not None:
+                    proc.stdin.close()
+            except OSError:
+                pass
             if proc.poll() is None:
                 proc.terminate()
             try:
@@ -315,46 +322,18 @@ class UplinkBridge(object):
                 proc.kill()
                 proc.wait()
 
-    def _wait_for_sco_available(self):
-        """Return True once the BlueALSA SCO PCM device can be opened, False if stopped."""
-        while not self._stop_event.is_set():
-            try:
-                pcm = alsaaudio.PCM(
-                    type=alsaaudio.PCM_PLAYBACK,
-                    mode=alsaaudio.PCM_NONBLOCK,
-                    device=self.playback_device,
-                    channels=self.channels,
-                    rate=self.sample_rate,
-                    format=alsaaudio.PCM_FORMAT_S16_LE,
-                    periodsize=self.period_frames,
-                )
-                del pcm
-                print("[UPLINK] BlueALSA SCO available")
-                return True
-            except alsaaudio.ALSAAudioError:
-                time.sleep(0.2)
-        return False
-
     def _run(self):
         backoff = self._BACKOFF_INITIAL
         while not self._stop_event.is_set():
-            if not self._wait_for_sco_available():
-                break
-
             rec_proc = None
             play_proc = None
             try:
-                rec_proc = subprocess.Popen(
-                    [
-                        'arecord',
-                        '-D', self.capture_device,
-                        '-f', 'S16_LE',
-                        '-r', str(self.sample_rate),
-                        '-c', str(self.channels),
-                    ],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.DEVNULL,
-                )
+                # Start aplay first with a Python-owned pipe as its stdin.
+                # This lets us delay arecord until aplay has opened the BlueALSA
+                # device and is actively draining. If we start both at once,
+                # arecord fills the 64KB kernel pipe (~4s at 8kHz/S16LE) before
+                # aplay finishes snd_pcm_open, causing the full buffer to be
+                # played back as a delay at the start of the call.
                 play_proc = subprocess.Popen(
                     [
                         'aplay',
@@ -362,16 +341,45 @@ class UplinkBridge(object):
                         '-f', 'S16_LE',
                         '-r', str(self.sample_rate),
                         '-c', str(self.channels),
+                        '-t', 'raw',
                     ],
-                    stdin=rec_proc.stdout,
+                    stdin=subprocess.PIPE,
                     stderr=subprocess.DEVNULL,
                 )
-                # Close parent copy so rec_proc receives SIGPIPE if play_proc exits.
-                rec_proc.stdout.close()
+                with self._proc_lock:
+                    self._play_proc = play_proc
+
+                # Give aplay a short window to fail fast if SCO is not open yet.
+                if self._stop_event.wait(0.05):
+                    break
+                if play_proc.poll() is not None:
+                    print("[UPLINK] aplay failed to open device (rc=%d), reconnecting..." % play_proc.returncode)
+                    continue
+
+                # aplay is running and consuming — now start arecord wired
+                # directly into aplay's stdin fd. The pipe is empty at this
+                # point so there is no accumulated latency.
+                rec_proc = subprocess.Popen(
+                    [
+                        'arecord',
+                        '-D', self.capture_device,
+                        '-f', 'S16_LE',
+                        '-r', str(self.sample_rate),
+                        '-c', str(self.channels),
+                        '-t', 'raw',
+                        '-B', '20000',
+                        '-F', '10000',
+                        '-A', '10000',
+                        '-R', '0',
+                    ],
+                    stdout=play_proc.stdin,
+                    stderr=subprocess.DEVNULL,
+                )
+                # Release parent's write-end so aplay gets EOF when arecord exits.
+                play_proc.stdin.close()
 
                 with self._proc_lock:
                     self._rec_proc = rec_proc
-                    self._play_proc = play_proc
 
                 backoff = self._BACKOFF_INITIAL
                 while not self._stop_event.is_set():
@@ -473,8 +481,7 @@ class DownlinkBridge(object):
             if capture is None:
                 return
 
-            if self.on_sco_ready is not None:
-                self.on_sco_ready()
+            sco_stream_notified = False
 
             playback = None
             try:
@@ -484,6 +491,10 @@ class DownlinkBridge(object):
                     if frames <= 0 or not data:
                         time.sleep(0.01)
                         continue
+                    if not sco_stream_notified:
+                        sco_stream_notified = True
+                        if self.on_sco_ready is not None:
+                            self.on_sco_ready()
                     playback.write(data)
             except alsaaudio.ALSAAudioError as exc:
                 print("[DOWNLINK] ALSA stream reset (%s), reconnecting..." % exc)
@@ -818,7 +829,7 @@ class Telephone(object):
         self.downlink_bridge = DownlinkBridge(
             bt_device='40:D1:60:4F:C2:15',
             playback_device='plughw:Device,0',
-            on_sco_ready=self.audio_player.stop,
+            on_sco_ready=self._on_sco_ready,
         )
         self.phone_manager = PhoneManager(self.audio_player, self.asset_dir)
         self._ring_stop_event = Event()
@@ -885,10 +896,20 @@ class Telephone(object):
         self._manual_number = ''
         self._last_digit_at = None
 
-    def _on_call_started(self):
-        """Called when a call becomes active. Start the SCO audio bridges."""
-        self._disable_wifi_for_call()
+    def _on_sco_ready(self):
+        """Called by the downlink bridge once the SCO link is confirmed active."""
+        self.audio_player.stop()
         self.uplink_bridge.start()
+
+    def _on_call_started(self):
+        """Called when a call becomes active. Start only the downlink bridge.
+
+        The uplink is started later via _on_sco_ready, once the downlink has
+        confirmed the SCO link is established. Starting the uplink before that
+        point causes arecord to buffer audio data against a not-yet-active SCO
+        channel, resulting in several seconds of delay at call start.
+        """
+        self._disable_wifi_for_call()
         self.downlink_bridge.start()
 
     def _on_call_ended(self):
