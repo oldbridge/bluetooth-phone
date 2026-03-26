@@ -545,9 +545,11 @@ class PhoneManager(object):
 
         logging.getLogger("dbus.proxies").setLevel(logging.WARNING)
 
+        self._manager = None
+
         try:
-            manager = dbus.Interface(self.bus.get_object('org.ofono', '/'), 'org.ofono.Manager')
-            modems = manager.GetModems()
+            self._manager = dbus.Interface(self.bus.get_object('org.ofono', '/'), 'org.ofono.Manager')
+            modems = self._manager.GetModems()
         except dbus.exceptions.DBusException as exc:
             self._report_init_error(exc)
             return
@@ -556,17 +558,11 @@ class PhoneManager(object):
             print("ofono is running but no modem is available")
             return
 
-        # Take the first modem (there should be actually only one in our case)
-        modem = str(modems[0][0])
-        self.modem_path = modem
-        print(modem)
-        self.org_ofono_obj = self.bus.get_object('org.ofono', modem)
-        self.voice_call_manager = dbus.Interface(self.org_ofono_obj, 'org.ofono.VoiceCallManager')
+        self._bind_best_modem(modems)
 
-        marker = '/org/bluez/'
-        marker_idx = modem.find(marker)
-        if marker_idx >= 0:
-            self.bt_device_path = modem[marker_idx:]
+        if self.voice_call_manager is None:
+            print("No usable oFono modem found")
+            return
 
         self.available = True
         has_call, has_incoming = self._get_call_info()
@@ -576,6 +572,104 @@ class PhoneManager(object):
         self._monitor_thread = Thread(target=self._monitor_calls, daemon=True)
         self._monitor_thread.start()
         print("Initialized")
+
+    def _modem_to_bt_path(self, modem_path):
+        marker = '/org/bluez/'
+        marker_idx = modem_path.find(marker)
+        if marker_idx >= 0:
+            return modem_path[marker_idx:]
+        return None
+
+    def _list_bluez_devices(self):
+        try:
+            object_manager = dbus.Interface(
+                self.bus.get_object('org.bluez', '/'),
+                'org.freedesktop.DBus.ObjectManager',
+            )
+            managed_objects = object_manager.GetManagedObjects()
+        except dbus.exceptions.DBusException:
+            return []
+
+        devices = []
+        for path, ifaces in managed_objects.items():
+            device = ifaces.get('org.bluez.Device1')
+            if not device:
+                continue
+            devices.append({
+                'path': str(path),
+                'address': str(device.get('Address', '')),
+                'alias': str(device.get('Alias', 'unknown')),
+                'paired': bool(device.get('Paired', False)),
+                'connected': bool(device.get('Connected', False)),
+                'blocked': bool(device.get('Blocked', False)),
+            })
+        return devices
+
+    def _modem_supports_voice_calls(self, modem_path):
+        try:
+            ofono_obj = self.bus.get_object('org.ofono', modem_path)
+            voice_call_manager = dbus.Interface(ofono_obj, 'org.ofono.VoiceCallManager')
+            # Probe a lightweight call. If the method is missing, this modem is stale.
+            voice_call_manager.GetCalls(timeout=self.DBUS_TIMEOUT_SECONDS)
+            return True
+        except dbus.exceptions.DBusException as exc:
+            return exc.get_dbus_name() != 'org.freedesktop.DBus.Error.UnknownMethod'
+
+    def _bind_best_modem(self, modems):
+        bluez_devices = self._list_bluez_devices()
+        connected_paths = {
+            d['path'] for d in bluez_devices
+            if d['paired'] and d['connected'] and not d['blocked']
+        }
+        paired_paths = {
+            d['path'] for d in bluez_devices
+            if d['paired'] and not d['blocked']
+        }
+
+        best = None
+        best_score = None
+
+        for idx, (path, _) in enumerate(modems):
+            modem_path = str(path)
+            bt_path = self._modem_to_bt_path(modem_path)
+            supports_voice = self._modem_supports_voice_calls(modem_path)
+            score = (
+                1 if bt_path in connected_paths else 0,
+                1 if supports_voice else 0,
+                1 if bt_path in paired_paths else 0,
+                -idx,
+            )
+            print("[OFONO] Candidate modem=%s bt_path=%s voice=%s score=%s" % (
+                modem_path,
+                bt_path,
+                supports_voice,
+                score,
+            ))
+            if best is None or score > best_score:
+                best = modem_path
+                best_score = score
+
+        if best is None:
+            return False
+
+        self.modem_path = best
+        self.bt_device_path = self._modem_to_bt_path(best)
+        print("[OFONO] Selected modem %s" % self.modem_path)
+        self.org_ofono_obj = self.bus.get_object('org.ofono', self.modem_path)
+        self.voice_call_manager = dbus.Interface(self.org_ofono_obj, 'org.ofono.VoiceCallManager')
+        return True
+
+    def _rebind_modem(self):
+        if self._manager is None:
+            return False
+        try:
+            modems = self._manager.GetModems()
+        except dbus.exceptions.DBusException as exc:
+            print("[OFONO] Failed to refresh modems: %s" % exc)
+            return False
+        if not modems:
+            return False
+        return self._bind_best_modem(modems)
 
     def _report_init_error(self, exc):
         name = exc.get_dbus_name()
@@ -721,47 +815,29 @@ class PhoneManager(object):
     def get_bt_device_address(self):
         """Return Bluetooth address of the currently connected paired device.
         
-        Strategy:
-        1. Try to extract address from oFono's modem path (most reliable for HFP)
-        2. Query BlueZ for ANY paired device (HFP may work even if BlueZ shows disconnected)
-        3. Return the first accessible device found
+        First tries the modem's associated device, then falls back to querying
+        BlueZ directly for any connected+paired device. This handles device
+        switches where oFono's cached path may not match the active device.
         """
-        print("[DEBUG] get_bt_device_address() called")
-        print("[DEBUG] modem_path=%s, bt_device_path=%s" % (self.modem_path, self.bt_device_path))
+        # Try modem-associated device first
+        if self.bt_device_path:
+            try:
+                dev_obj = self.bus.get_object('org.bluez', self.bt_device_path)
+                props_iface = dbus.Interface(dev_obj, 'org.freedesktop.DBus.Properties')
+                address = str(props_iface.Get('org.bluez.Device1', 'Address'))
+                connected = bool(props_iface.Get('org.bluez.Device1', 'Connected'))
+                if address and connected:
+                    return address
+            except dbus.exceptions.DBusException:
+                pass
         
-        # First: Try to extract device address from oFono's modem path
-        # oFono's HFP path looks like: /hfp/org/bluez/hci0/dev_XX_XX_XX_XX_XX_XX
-        # This is more reliable than BlueZ's "Connected" state
-        if self.modem_path:
-            match = re.search(r'/dev_([0-9A-Fa-f_]+)$', self.modem_path)
-            if match:
-                candidate = match.group(1).replace('_', ':').upper()
-                if len(candidate) == 17:
-                    print("[DEBUG] Extracted from oFono modem path: %s" % candidate)
-                    try:
-                        # Verify device is accessible and paired
-                        dev_obj = self.bus.get_object('org.bluez', self.bt_device_path or ('/org/bluez/hci0/dev_' + candidate.replace(':', '_')))
-                        props_iface = dbus.Interface(dev_obj, 'org.freedesktop.DBus.Properties')
-                        paired = bool(props_iface.Get('org.bluez.Device1', 'Paired'))
-                        blocked = bool(props_iface.Get('org.bluez.Device1', 'Blocked'))
-                        print("[DEBUG] oFono device %s: paired=%s, blocked=%s" % (candidate, paired, blocked))
-                        if paired and not blocked:
-                            print("[DEBUG] Using oFono device (HFP established): %s" % candidate)
-                            return candidate
-                    except dbus.exceptions.DBusException as exc:
-                        print("[DEBUG] oFono device verification failed: %s" % exc)
-        
-        # Second: Fallback to BlueZ scan - look for ANY paired device
-        # We don't strictly require "connected" because HFP connectivity may not match BlueZ state
-        print("[DEBUG] Falling back to BlueZ device scan...")
+        # Fallback: query BlueZ for ANY connected+paired device
         try:
             object_manager = dbus.Interface(
                 self.bus.get_object('org.bluez', '/'),
                 'org.freedesktop.DBus.ObjectManager',
             )
             managed_objects = object_manager.GetManagedObjects()
-            
-            # First pass: look for connected+paired devices
             for path, ifaces in managed_objects.items():
                 device = ifaces.get('org.bluez.Device1')
                 if not device:
@@ -771,34 +847,12 @@ class PhoneManager(object):
                 connected = bool(device.get('Connected', False))
                 blocked = bool(device.get('Blocked', False))
                 address = str(device.get('Address', ''))
-                alias = str(device.get('Alias', 'unknown'))
-                
-                print("[DEBUG] BlueZ device %s (%s): paired=%s, connected=%s, blocked=%s" % (alias, address, paired, connected, blocked))
                 
                 if paired and connected and not blocked and address:
-                    print("[DEBUG] Using connected BlueZ device: %s" % address)
                     return address
-            
-            # Second pass: if no connected device found, use first paired device
-            # HFP may work even if BlueZ shows disconnected
-            for path, ifaces in managed_objects.items():
-                device = ifaces.get('org.bluez.Device1')
-                if not device:
-                    continue
-                
-                paired = bool(device.get('Paired', False))
-                blocked = bool(device.get('Blocked', False))
-                address = str(device.get('Address', ''))
-                alias = str(device.get('Alias', 'unknown'))
-                
-                if paired and not blocked and address:
-                    print("[DEBUG] Using ANY paired BlueZ device as fallback: %s (%s)" % (address, alias))
-                    return address
-                    
-        except dbus.exceptions.DBusException as exc:
-            print("[DEBUG] BlueZ scan failed: %s" % exc)
+        except dbus.exceptions.DBusException:
+            pass
         
-        print("[DEBUG] NO device found!")
         return None
 
     def _dial_candidates(self, normalized_number):
@@ -821,9 +875,7 @@ class PhoneManager(object):
         """
         Method to place call. It handles incorrectly dialed numbers thanks to ofono exceptions
         """
-        print("[DEBUG] call() invoked: number=%s, available=%s, voice_call_manager=%s" % (number, self.available, self.voice_call_manager is not None))
         if not self.available or self.voice_call_manager is None:
-            print("[DEBUG] Call system not available (available=%s, mgr=%s)" % (self.available, self.voice_call_manager))
             print("Call system not available")
             self.audio_player.play(self._asset_path("not_connected.wav"))
             return
@@ -837,35 +889,47 @@ class PhoneManager(object):
         candidates = self._dial_candidates(normalized_number)
         hide_id_candidates = [hide_id, 'default', '']
         hide_id_candidates = [h for i, h in enumerate(hide_id_candidates) if h not in hide_id_candidates[:i]]
-        try:
-            for candidate in candidates:
-                for hide_id_option in hide_id_candidates:
-                    try:
-                        print("Dialing via oFono: %s (hide_id=%r)" % (candidate, hide_id_option))
-                        self.voice_call_manager.Dial(
-                            candidate,
-                            hide_id_option,
-                            timeout=self.DBUS_TIMEOUT_SECONDS,
-                        )
-                        self._set_call_state(True)
-                        return
-                    except dbus.exceptions.DBusException as e:
-                        if e.get_dbus_name() != 'org.ofono.Error.InvalidFormat':
-                            raise
-            print("Invalid dialed number format!")
-            self.audio_player.play(self._asset_path("format_incorrect.wav"))
-        except dbus.exceptions.DBusException as e:
-            name = e.get_dbus_name()
-            print("[DEBUG] oFono call exception: %s" % name)
-            print("[DEBUG] Full exception: %s" % str(e))
-            print("[DEBUG] modem_path: %s" % self.modem_path)
-            print("[DEBUG] bt_device_path: %s" % self.bt_device_path)
-            if name == 'org.freedesktop.DBus.Error.UnknownMethod':
-                print("[DEBUG] UnknownMethod - HFP likely not established. modem=%s" % self.modem_path)
-                print("Ofono not running")
-                self.audio_player.play(self._asset_path("not_connected.wav"))
-            else:
-                print(name)
+
+        last_error = None
+        for attempt in range(2):
+            try:
+                for candidate in candidates:
+                    for hide_id_option in hide_id_candidates:
+                        try:
+                            print("Dialing via oFono modem=%s: %s (hide_id=%r)" % (
+                                self.modem_path,
+                                candidate,
+                                hide_id_option,
+                            ))
+                            self.voice_call_manager.Dial(
+                                candidate,
+                                hide_id_option,
+                                timeout=self.DBUS_TIMEOUT_SECONDS,
+                            )
+                            self._set_call_state(True)
+                            return
+                        except dbus.exceptions.DBusException as e:
+                            if e.get_dbus_name() != 'org.ofono.Error.InvalidFormat':
+                                raise
+                print("Invalid dialed number format!")
+                self.audio_player.play(self._asset_path("format_incorrect.wav"))
+                return
+            except dbus.exceptions.DBusException as e:
+                last_error = e
+                if e.get_dbus_name() == 'org.freedesktop.DBus.Error.UnknownMethod' and attempt == 0:
+                    print("[OFONO] Dial method missing on modem %s, refreshing modem binding..." % self.modem_path)
+                    if self._rebind_modem():
+                        continue
+                break
+
+        if last_error is None:
+            return
+        name = last_error.get_dbus_name()
+        if name == 'org.freedesktop.DBus.Error.UnknownMethod':
+            print("Ofono not running")
+            self.audio_player.play(self._asset_path("not_connected.wav"))
+        else:
+            print(name)
 
     def close(self):
         if not self.available:
@@ -875,12 +939,7 @@ class PhoneManager(object):
             self._monitor_thread.join(timeout=1)
 
     def has_paired_device(self, require_connected=True):
-        """Return True when at least one usable BlueZ device is present.
-        
-        Note: Even devices without BlueZ "Connected" state may work for HFP,
-        so we primarily check for "paired" status when require_connected=True,
-        since HFP connectivity (oFono) and BlueZ connectivity don't always align.
-        """
+        """Return True when at least one usable BlueZ device is present."""
         try:
             object_manager = dbus.Interface(
                 self.bus.get_object('org.bluez', '/'),
@@ -908,18 +967,19 @@ class PhoneManager(object):
 
                 if not paired or blocked:
                     continue
-                # When require_connected=True, accept ANY paired device:
-                # HFP may work even if BlueZ shows disconnected. Only check if oFono
-                # has a modem path available.
-                if require_connected and not self.modem_path:
-                    # No oFono modem = HFP not available
-                    if not connected:
-                        continue
+                # BlueZ Connected can be false while oFono/HFP is still usable.
+                # If oFono already exposes a modem, accept paired devices.
+                if require_connected and not connected and not self.modem_path:
+                    continue
 
                 found = True
                 break
 
-            print("[BT] Usable device present=%s (require_connected=%s, modem_path=%s)" % (found, require_connected, self.modem_path))
+            print("[BT] Usable device present=%s (require_connected=%s, modem_path=%s)" % (
+                found,
+                require_connected,
+                self.modem_path,
+            ))
             return found
         except dbus.exceptions.DBusException as exc:
             print("Cannot query BlueZ paired devices: %s" % exc)
@@ -940,12 +1000,11 @@ class Telephone(object):
         self.number_q = queue.Queue()
         self.audio_player = AudioPlayer()
         self.phone_manager = PhoneManager(self.audio_player, self.asset_dir)
-        print("[BT] ***INIT*** Querying initial device...")
         modem_bt_device = self.phone_manager.get_bt_device_address()
         if modem_bt_device:
-            print("[BT] ***INIT*** Using Bluetooth device %s" % modem_bt_device)
+            print("[BT] Using Bluetooth device %s" % modem_bt_device)
         else:
-            print("[BT] ***INIT*** No connected paired Bluetooth device found yet")
+            print("[BT] No connected paired Bluetooth device found yet")
         self.uplink_bridge = UplinkBridge(bt_device=modem_bt_device, capture_device='plughw:Device,0')
         self.downlink_bridge = DownlinkBridge(
             bt_device=modem_bt_device,
@@ -1028,17 +1087,13 @@ class Telephone(object):
         cached device from initialization. Critical when switching between
         multiple paired phones.
         """
-        print("[BT] _refresh_bridge_bt_device() called")
         modem_bt_device = self.phone_manager.get_bt_device_address()
-        print("[BT] Device query returned: %s" % modem_bt_device)
         if not modem_bt_device:
             print("[BT] Cannot refresh bridge device: no connected paired device available")
             return False
         self.uplink_bridge.set_bt_device(modem_bt_device)
         self.downlink_bridge.set_bt_device(modem_bt_device)
-        print("[BT] Bridges updated to device: %s" % modem_bt_device)
-        print("[BT] Uplink playback_device: %s" % self.uplink_bridge.playback_device)
-        print("[BT] Downlink capture_device: %s" % self.downlink_bridge.capture_device)
+        print("[BT] Bridge device refreshed to %s" % modem_bt_device)
         return True
 
     def _on_call_started(self):
@@ -1049,7 +1104,6 @@ class Telephone(object):
         point causes arecord to buffer audio data against a not-yet-active SCO
         channel, resulting in several seconds of delay at call start.
         """
-        print("[CALL] ***_on_call_started() invoked***")
         self._refresh_bridge_bt_device()
         self._disable_wifi_for_call()
         self.downlink_bridge.start()
