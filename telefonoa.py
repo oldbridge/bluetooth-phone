@@ -9,6 +9,7 @@ import alsaaudio
 import yaml
 import logging
 import math
+import re
 import struct
 
 from pathlib import Path
@@ -255,10 +256,10 @@ class UplinkBridge(object):
     _BACKOFF_INITIAL = 0.2
     _BACKOFF_MAX = 8.0
 
-    def __init__(self, bt_device, capture_device='plughw:Device,0', sample_rate=8000, channels=1, period_frames=160):
-        self.bt_device = bt_device
+    def __init__(self, bt_device=None, capture_device='plughw:Device,0', sample_rate=8000, channels=1, period_frames=160):
+        self.bt_device = None
         self.capture_device = capture_device
-        self.playback_device = "bluealsa:DEV=%s,PROFILE=sco" % bt_device
+        self.playback_device = None
         self.sample_rate = sample_rate
         self.channels = channels
         self.period_frames = period_frames
@@ -268,6 +269,15 @@ class UplinkBridge(object):
         self._proc_lock = Lock()
         self._rec_proc = None
         self._play_proc = None
+        self.set_bt_device(bt_device)
+
+    def set_bt_device(self, bt_device):
+        with self._lock:
+            self.bt_device = str(bt_device).strip() if bt_device else None
+            if self.bt_device:
+                self.playback_device = "bluealsa:DEV=%s,PROFILE=sco" % self.bt_device
+            else:
+                self.playback_device = None
 
     @property
     def is_running(self):
@@ -275,6 +285,9 @@ class UplinkBridge(object):
             return self._thread is not None and self._thread.is_alive()
 
     def start(self):
+        if not self.playback_device:
+            print("[UPLINK] No Bluetooth device configured, not starting")
+            return
         with self._lock:
             if self._thread is not None and self._thread.is_alive():
                 return
@@ -307,13 +320,6 @@ class UplinkBridge(object):
         for proc in (rec, play):
             if proc is None:
                 continue
-            # Close stdin so aplay gets EOF and exits cleanly if arecord hasn't
-            # taken over the write-end of the pipe yet (early termination path).
-            try:
-                if proc.stdin is not None:
-                    proc.stdin.close()
-            except OSError:
-                pass
             if proc.poll() is None:
                 proc.terminate()
             try:
@@ -322,43 +328,35 @@ class UplinkBridge(object):
                 proc.kill()
                 proc.wait()
 
+    def _wait_for_sco_available(self):
+        """Return True once the BlueALSA SCO PCM device can be opened, False if stopped."""
+        while not self._stop_event.is_set():
+            try:
+                pcm = alsaaudio.PCM(
+                    type=alsaaudio.PCM_PLAYBACK,
+                    mode=alsaaudio.PCM_NONBLOCK,
+                    device=self.playback_device,
+                    channels=self.channels,
+                    rate=self.sample_rate,
+                    format=alsaaudio.PCM_FORMAT_S16_LE,
+                    periodsize=self.period_frames,
+                )
+                del pcm
+                print("[UPLINK] BlueALSA SCO available")
+                return True
+            except alsaaudio.ALSAAudioError:
+                time.sleep(0.2)
+        return False
+
     def _run(self):
         backoff = self._BACKOFF_INITIAL
         while not self._stop_event.is_set():
+            if not self._wait_for_sco_available():
+                break
+
             rec_proc = None
             play_proc = None
             try:
-                # Start aplay first with a Python-owned pipe as its stdin.
-                # This lets us delay arecord until aplay has opened the BlueALSA
-                # device and is actively draining. If we start both at once,
-                # arecord fills the 64KB kernel pipe (~4s at 8kHz/S16LE) before
-                # aplay finishes snd_pcm_open, causing the full buffer to be
-                # played back as a delay at the start of the call.
-                play_proc = subprocess.Popen(
-                    [
-                        'aplay',
-                        '-D', self.playback_device,
-                        '-f', 'S16_LE',
-                        '-r', str(self.sample_rate),
-                        '-c', str(self.channels),
-                        '-t', 'raw',
-                    ],
-                    stdin=subprocess.PIPE,
-                    stderr=subprocess.DEVNULL,
-                )
-                with self._proc_lock:
-                    self._play_proc = play_proc
-
-                # Give aplay a short window to fail fast if SCO is not open yet.
-                if self._stop_event.wait(0.05):
-                    break
-                if play_proc.poll() is not None:
-                    print("[UPLINK] aplay failed to open device (rc=%d), reconnecting..." % play_proc.returncode)
-                    continue
-
-                # aplay is running and consuming — now start arecord wired
-                # directly into aplay's stdin fd. The pipe is empty at this
-                # point so there is no accumulated latency.
                 rec_proc = subprocess.Popen(
                     [
                         'arecord',
@@ -366,20 +364,27 @@ class UplinkBridge(object):
                         '-f', 'S16_LE',
                         '-r', str(self.sample_rate),
                         '-c', str(self.channels),
-                        '-t', 'raw',
-                        '-B', '20000',
-                        '-F', '10000',
-                        '-A', '10000',
-                        '-R', '0',
                     ],
-                    stdout=play_proc.stdin,
+                    stdout=subprocess.PIPE,
                     stderr=subprocess.DEVNULL,
                 )
-                # Release parent's write-end so aplay gets EOF when arecord exits.
-                play_proc.stdin.close()
+                play_proc = subprocess.Popen(
+                    [
+                        'aplay',
+                        '-D', self.playback_device,
+                        '-f', 'S16_LE',
+                        '-r', str(self.sample_rate),
+                        '-c', str(self.channels),
+                    ],
+                    stdin=rec_proc.stdout,
+                    stderr=subprocess.DEVNULL,
+                )
+                # Close parent copy so rec_proc receives SIGPIPE if play_proc exits.
+                rec_proc.stdout.close()
 
                 with self._proc_lock:
                     self._rec_proc = rec_proc
+                    self._play_proc = play_proc
 
                 backoff = self._BACKOFF_INITIAL
                 while not self._stop_event.is_set():
@@ -409,9 +414,9 @@ class UplinkBridge(object):
 class DownlinkBridge(object):
     """Capture BlueALSA SCO and play to USB audio device (phone speaker)."""
 
-    def __init__(self, bt_device, playback_device='plughw:Device,0', sample_rate=8000, channels=1, period_frames=120, on_sco_ready=None):
-        self.bt_device = bt_device
-        self.capture_device = "bluealsa:DEV=%s,PROFILE=sco" % bt_device
+    def __init__(self, bt_device=None, playback_device='plughw:Device,0', sample_rate=8000, channels=1, period_frames=120, on_sco_ready=None):
+        self.bt_device = None
+        self.capture_device = None
         self.playback_device = playback_device
         self.sample_rate = sample_rate
         self.channels = channels
@@ -420,6 +425,15 @@ class DownlinkBridge(object):
         self._stop_event = Event()
         self._thread = None
         self._lock = Lock()
+        self.set_bt_device(bt_device)
+
+    def set_bt_device(self, bt_device):
+        with self._lock:
+            self.bt_device = str(bt_device).strip() if bt_device else None
+            if self.bt_device:
+                self.capture_device = "bluealsa:DEV=%s,PROFILE=sco" % self.bt_device
+            else:
+                self.capture_device = None
 
     @property
     def is_running(self):
@@ -427,6 +441,9 @@ class DownlinkBridge(object):
             return self._thread is not None and self._thread.is_alive()
 
     def start(self):
+        if not self.capture_device:
+            print("[DOWNLINK] No Bluetooth device configured, not starting")
+            return
         with self._lock:
             if self._thread is not None and self._thread.is_alive():
                 return
@@ -481,7 +498,8 @@ class DownlinkBridge(object):
             if capture is None:
                 return
 
-            sco_stream_notified = False
+            if self.on_sco_ready is not None:
+                self.on_sco_ready()
 
             playback = None
             try:
@@ -491,10 +509,6 @@ class DownlinkBridge(object):
                     if frames <= 0 or not data:
                         time.sleep(0.01)
                         continue
-                    if not sco_stream_notified:
-                        sco_stream_notified = True
-                        if self.on_sco_ready is not None:
-                            self.on_sco_ready()
                     playback.write(data)
             except alsaaudio.ALSAAudioError as exc:
                 print("[DOWNLINK] ALSA stream reset (%s), reconnecting..." % exc)
@@ -704,6 +718,28 @@ class PhoneManager(object):
             return ''
         return ('+' if has_plus else '') + digits
 
+    def get_bt_device_address(self):
+        """Return Bluetooth address associated with the current oFono modem."""
+        if not self.bt_device_path:
+            return None
+
+        try:
+            dev_obj = self.bus.get_object('org.bluez', self.bt_device_path)
+            props_iface = dbus.Interface(dev_obj, 'org.freedesktop.DBus.Properties')
+            address = str(props_iface.Get('org.bluez.Device1', 'Address'))
+            if address:
+                return address
+        except dbus.exceptions.DBusException:
+            pass
+
+        match = re.search(r'/dev_([0-9A-Fa-f_]+)$', self.bt_device_path)
+        if match:
+            candidate = match.group(1).replace('_', ':').upper()
+            if len(candidate) == 17:
+                return candidate
+
+        return None
+
     def _dial_candidates(self, normalized_number):
         candidates = [normalized_number]
         if normalized_number.startswith('+'):
@@ -825,13 +861,18 @@ class Telephone(object):
         GPIO.setup(self.ringer_pin, GPIO.OUT, initial=GPIO.HIGH)
         self.number_q = queue.Queue()
         self.audio_player = AudioPlayer()
-        self.uplink_bridge = UplinkBridge(bt_device='40:D1:60:4F:C2:15', capture_device='plughw:Device,0')
+        self.phone_manager = PhoneManager(self.audio_player, self.asset_dir)
+        modem_bt_device = self.phone_manager.get_bt_device_address()
+        if modem_bt_device:
+            print("[BT] Using modem Bluetooth device %s" % modem_bt_device)
+        else:
+            print("[BT] No modem Bluetooth device found yet")
+        self.uplink_bridge = UplinkBridge(bt_device=modem_bt_device, capture_device='plughw:Device,0')
         self.downlink_bridge = DownlinkBridge(
-            bt_device='40:D1:60:4F:C2:15',
+            bt_device=modem_bt_device,
             playback_device='plughw:Device,0',
             on_sco_ready=self._on_sco_ready,
         )
-        self.phone_manager = PhoneManager(self.audio_player, self.asset_dir)
         self._ring_stop_event = Event()
         self._ring_lock = Lock()
         self._ringer_io_lock = Lock()
@@ -901,6 +942,16 @@ class Telephone(object):
         self.audio_player.stop()
         self.uplink_bridge.start()
 
+    def _refresh_bridge_bt_device(self):
+        modem_bt_device = self.phone_manager.get_bt_device_address()
+        if not modem_bt_device:
+            print("[BT] Cannot refresh bridge device: modem device not available")
+            return False
+        self.uplink_bridge.set_bt_device(modem_bt_device)
+        self.downlink_bridge.set_bt_device(modem_bt_device)
+        print("[BT] Bridge device set to %s" % modem_bt_device)
+        return True
+
     def _on_call_started(self):
         """Called when a call becomes active. Start only the downlink bridge.
 
@@ -909,6 +960,7 @@ class Telephone(object):
         point causes arecord to buffer audio data against a not-yet-active SCO
         channel, resulting in several seconds of delay at call start.
         """
+        self._refresh_bridge_bt_device()
         self._disable_wifi_for_call()
         self.downlink_bridge.start()
 
