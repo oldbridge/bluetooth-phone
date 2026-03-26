@@ -451,6 +451,7 @@ class DownlinkBridge(object):
 
 class PhoneManager(object):
     POLL_INTERVAL_SECONDS = 0.5
+    DBUS_TIMEOUT_SECONDS = 8
 
     def __init__(self, audio_player, asset_dir):
         """
@@ -460,6 +461,8 @@ class PhoneManager(object):
         self.asset_dir = Path(asset_dir)
         self.bus = dbus.SystemBus()
         self.voice_call_manager = None
+        self.modem_path = None
+        self.bt_device_path = None
         self.call_in_progress = False
         self.incoming_call = False
         self.on_incoming_call_changed = None
@@ -481,10 +484,16 @@ class PhoneManager(object):
             return
 
         # Take the first modem (there should be actually only one in our case)
-        modem = modems[0][0]
+        modem = str(modems[0][0])
+        self.modem_path = modem
         print(modem)
         self.org_ofono_obj = self.bus.get_object('org.ofono', modem)
         self.voice_call_manager = dbus.Interface(self.org_ofono_obj, 'org.ofono.VoiceCallManager')
+
+        marker = '/org/bluez/'
+        marker_idx = modem.find(marker)
+        if marker_idx >= 0:
+            self.bt_device_path = modem[marker_idx:]
 
         self.available = True
         has_call, has_incoming = self._get_call_info()
@@ -512,7 +521,7 @@ class PhoneManager(object):
         if self.voice_call_manager is None:
             return False, False
         try:
-            calls = self.voice_call_manager.GetCalls()
+            calls = self.voice_call_manager.GetCalls(timeout=self.DBUS_TIMEOUT_SECONDS)
             if not calls:
                 return False, False
             states = {str(props.get('State', '')) for _, props in calls}
@@ -520,6 +529,38 @@ class PhoneManager(object):
             return True, has_incoming
         except dbus.exceptions.DBusException:
             return False, False
+
+    def _disconnect_bt_device(self):
+        if not self.bt_device_path:
+            return
+        try:
+            dev_obj = self.bus.get_object('org.bluez', self.bt_device_path)
+            dev_iface = dbus.Interface(dev_obj, 'org.bluez.Device1')
+            dev_iface.Disconnect()
+            print("[BT] Forced disconnect on %s to recover HFP state" % self.bt_device_path)
+        except dbus.exceptions.DBusException as exc:
+            print("[BT] Forced disconnect failed: %s" % exc)
+
+    def _hangup_all_calls(self):
+        try:
+            self.voice_call_manager.HangupAll(timeout=self.DBUS_TIMEOUT_SECONDS)
+            return
+        except dbus.exceptions.DBusException as exc:
+            if exc.get_dbus_name() != 'org.freedesktop.DBus.Error.UnknownMethod':
+                raise
+
+        try:
+            calls = self.voice_call_manager.GetCalls(timeout=self.DBUS_TIMEOUT_SECONDS)
+        except dbus.exceptions.DBusException as exc:
+            if exc.get_dbus_name() == 'org.freedesktop.DBus.Error.UnknownMethod':
+                # HFP voice-call methods are not published yet (e.g. before SLC).
+                return
+            raise
+
+        for path, _ in calls:
+            call_obj = self.bus.get_object('org.ofono', path)
+            call_iface = dbus.Interface(call_obj, 'org.ofono.VoiceCall')
+            call_iface.Hangup(timeout=self.DBUS_TIMEOUT_SECONDS)
 
     def _set_call_state(self, in_progress):
         if in_progress == self.call_in_progress:
@@ -558,7 +599,7 @@ class PhoneManager(object):
         if not self.available or self.voice_call_manager is None:
             return
         try:
-            self.voice_call_manager.HangupAll()
+            self._hangup_all_calls()
             self._set_call_state(False)
             self._set_incoming_state(False)
         except dbus.exceptions.DBusException as exc:
@@ -567,6 +608,11 @@ class PhoneManager(object):
             # Treat this as non-fatal so the main runtime loop keeps running.
             if name == 'org.ofono.Error.InProgress':
                 print("Hangup in progress, keeping service alive")
+                self._disconnect_bt_device()
+                return
+            if name == 'org.freedesktop.DBus.Error.NoReply':
+                print("Hangup timed out, forcing HFP reconnect")
+                self._disconnect_bt_device()
                 return
             print("Failed to hang up call: %s" % exc)
 
@@ -575,12 +621,12 @@ class PhoneManager(object):
         if not self.available or self.voice_call_manager is None:
             return
         try:
-            calls = self.voice_call_manager.GetCalls()
+            calls = self.voice_call_manager.GetCalls(timeout=self.DBUS_TIMEOUT_SECONDS)
             for path, props in calls:
                 if str(props.get('State', '')) == 'incoming':
                     call_obj = self.bus.get_object('org.ofono', path)
                     call_iface = dbus.Interface(call_obj, 'org.ofono.VoiceCall')
-                    call_iface.Answer()
+                    call_iface.Answer(timeout=self.DBUS_TIMEOUT_SECONDS)
                     self._set_call_state(True)
                     self._set_incoming_state(False)
                     return
@@ -638,7 +684,11 @@ class PhoneManager(object):
                 for hide_id_option in hide_id_candidates:
                     try:
                         print("Dialing via oFono: %s (hide_id=%r)" % (candidate, hide_id_option))
-                        self.voice_call_manager.Dial(candidate, hide_id_option)
+                        self.voice_call_manager.Dial(
+                            candidate,
+                            hide_id_option,
+                            timeout=self.DBUS_TIMEOUT_SECONDS,
+                        )
                         self._set_call_state(True)
                         return
                     except dbus.exceptions.DBusException as e:
@@ -972,6 +1022,10 @@ class Telephone(object):
                     elif c == 5:
                         self.ringer_test()
                     elif 1 <= c <= len(self.phonebook):
+                        if self.phone_manager.call_in_progress or self.phone_manager.incoming_call:
+                            print("Call already active/incoming, skipping shortcut dial")
+                            self.start_busy_tone()
+                            continue
                         print("Shortcut action %d: Automatic dial" % c)
                         shortcut_number = str(self.phonebook[c - 1].get('number', '')).strip()
                         if not shortcut_number:
