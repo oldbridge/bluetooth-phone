@@ -721,29 +721,38 @@ class PhoneManager(object):
     def get_bt_device_address(self):
         """Return Bluetooth address of the currently connected paired device.
         
-        First tries the modem's associated device, then falls back to querying
-        BlueZ directly for any connected+paired device. This handles device
-        switches where oFono's cached path may not match the active device.
+        Strategy:
+        1. Try to extract address from oFono's modem path (most reliable for HFP)
+        2. Query BlueZ for ANY paired device (HFP may work even if BlueZ shows disconnected)
+        3. Return the first accessible device found
         """
         print("[DEBUG] get_bt_device_address() called")
         print("[DEBUG] modem_path=%s, bt_device_path=%s" % (self.modem_path, self.bt_device_path))
         
-        # Try modem-associated device first
-        if self.bt_device_path:
-            try:
-                dev_obj = self.bus.get_object('org.bluez', self.bt_device_path)
-                props_iface = dbus.Interface(dev_obj, 'org.freedesktop.DBus.Properties')
-                address = str(props_iface.Get('org.bluez.Device1', 'Address'))
-                connected = bool(props_iface.Get('org.bluez.Device1', 'Connected'))
-                print("[DEBUG] Modem device %s: address=%s, connected=%s" % (self.bt_device_path, address, connected))
-                if address and connected:
-                    print("[DEBUG] Using modem-associated device: %s" % address)
-                    return address
-            except dbus.exceptions.DBusException as exc:
-                print("[DEBUG] Modem device lookup failed: %s" % exc)
-                pass
+        # First: Try to extract device address from oFono's modem path
+        # oFono's HFP path looks like: /hfp/org/bluez/hci0/dev_XX_XX_XX_XX_XX_XX
+        # This is more reliable than BlueZ's "Connected" state
+        if self.modem_path:
+            match = re.search(r'/dev_([0-9A-Fa-f_]+)$', self.modem_path)
+            if match:
+                candidate = match.group(1).replace('_', ':').upper()
+                if len(candidate) == 17:
+                    print("[DEBUG] Extracted from oFono modem path: %s" % candidate)
+                    try:
+                        # Verify device is accessible and paired
+                        dev_obj = self.bus.get_object('org.bluez', self.bt_device_path or ('/org/bluez/hci0/dev_' + candidate.replace(':', '_')))
+                        props_iface = dbus.Interface(dev_obj, 'org.freedesktop.DBus.Properties')
+                        paired = bool(props_iface.Get('org.bluez.Device1', 'Paired'))
+                        blocked = bool(props_iface.Get('org.bluez.Device1', 'Blocked'))
+                        print("[DEBUG] oFono device %s: paired=%s, blocked=%s" % (candidate, paired, blocked))
+                        if paired and not blocked:
+                            print("[DEBUG] Using oFono device (HFP established): %s" % candidate)
+                            return candidate
+                    except dbus.exceptions.DBusException as exc:
+                        print("[DEBUG] oFono device verification failed: %s" % exc)
         
-        # Fallback: query BlueZ for ANY connected+paired device
+        # Second: Fallback to BlueZ scan - look for ANY paired device
+        # We don't strictly require "connected" because HFP connectivity may not match BlueZ state
         print("[DEBUG] Falling back to BlueZ device scan...")
         try:
             object_manager = dbus.Interface(
@@ -751,6 +760,8 @@ class PhoneManager(object):
                 'org.freedesktop.DBus.ObjectManager',
             )
             managed_objects = object_manager.GetManagedObjects()
+            
+            # First pass: look for connected+paired devices
             for path, ifaces in managed_objects.items():
                 device = ifaces.get('org.bluez.Device1')
                 if not device:
@@ -765,11 +776,27 @@ class PhoneManager(object):
                 print("[DEBUG] BlueZ device %s (%s): paired=%s, connected=%s, blocked=%s" % (alias, address, paired, connected, blocked))
                 
                 if paired and connected and not blocked and address:
-                    print("[DEBUG] Using BlueZ fallback device: %s" % address)
+                    print("[DEBUG] Using connected BlueZ device: %s" % address)
                     return address
+            
+            # Second pass: if no connected device found, use first paired device
+            # HFP may work even if BlueZ shows disconnected
+            for path, ifaces in managed_objects.items():
+                device = ifaces.get('org.bluez.Device1')
+                if not device:
+                    continue
+                
+                paired = bool(device.get('Paired', False))
+                blocked = bool(device.get('Blocked', False))
+                address = str(device.get('Address', ''))
+                alias = str(device.get('Alias', 'unknown'))
+                
+                if paired and not blocked and address:
+                    print("[DEBUG] Using ANY paired BlueZ device as fallback: %s (%s)" % (address, alias))
+                    return address
+                    
         except dbus.exceptions.DBusException as exc:
             print("[DEBUG] BlueZ scan failed: %s" % exc)
-            pass
         
         print("[DEBUG] NO device found!")
         return None
@@ -848,7 +875,12 @@ class PhoneManager(object):
             self._monitor_thread.join(timeout=1)
 
     def has_paired_device(self, require_connected=True):
-        """Return True when at least one usable BlueZ device is present."""
+        """Return True when at least one usable BlueZ device is present.
+        
+        Note: Even devices without BlueZ "Connected" state may work for HFP,
+        so we primarily check for "paired" status when require_connected=True,
+        since HFP connectivity (oFono) and BlueZ connectivity don't always align.
+        """
         try:
             object_manager = dbus.Interface(
                 self.bus.get_object('org.bluez', '/'),
@@ -876,13 +908,18 @@ class PhoneManager(object):
 
                 if not paired or blocked:
                     continue
-                if require_connected and not connected:
-                    continue
+                # When require_connected=True, accept ANY paired device:
+                # HFP may work even if BlueZ shows disconnected. Only check if oFono
+                # has a modem path available.
+                if require_connected and not self.modem_path:
+                    # No oFono modem = HFP not available
+                    if not connected:
+                        continue
 
                 found = True
                 break
 
-            print("[BT] Usable device present=%s (require_connected=%s)" % (found, require_connected))
+            print("[BT] Usable device present=%s (require_connected=%s, modem_path=%s)" % (found, require_connected, self.modem_path))
             return found
         except dbus.exceptions.DBusException as exc:
             print("Cannot query BlueZ paired devices: %s" % exc)
