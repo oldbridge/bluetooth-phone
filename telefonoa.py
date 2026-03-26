@@ -725,6 +725,9 @@ class PhoneManager(object):
         BlueZ directly for any connected+paired device. This handles device
         switches where oFono's cached path may not match the active device.
         """
+        print("[DEBUG] get_bt_device_address() called")
+        print("[DEBUG] modem_path=%s, bt_device_path=%s" % (self.modem_path, self.bt_device_path))
+        
         # Try modem-associated device first
         if self.bt_device_path:
             try:
@@ -732,12 +735,16 @@ class PhoneManager(object):
                 props_iface = dbus.Interface(dev_obj, 'org.freedesktop.DBus.Properties')
                 address = str(props_iface.Get('org.bluez.Device1', 'Address'))
                 connected = bool(props_iface.Get('org.bluez.Device1', 'Connected'))
+                print("[DEBUG] Modem device %s: address=%s, connected=%s" % (self.bt_device_path, address, connected))
                 if address and connected:
+                    print("[DEBUG] Using modem-associated device: %s" % address)
                     return address
-            except dbus.exceptions.DBusException:
+            except dbus.exceptions.DBusException as exc:
+                print("[DEBUG] Modem device lookup failed: %s" % exc)
                 pass
         
         # Fallback: query BlueZ for ANY connected+paired device
+        print("[DEBUG] Falling back to BlueZ device scan...")
         try:
             object_manager = dbus.Interface(
                 self.bus.get_object('org.bluez', '/'),
@@ -753,12 +760,18 @@ class PhoneManager(object):
                 connected = bool(device.get('Connected', False))
                 blocked = bool(device.get('Blocked', False))
                 address = str(device.get('Address', ''))
+                alias = str(device.get('Alias', 'unknown'))
+                
+                print("[DEBUG] BlueZ device %s (%s): paired=%s, connected=%s, blocked=%s" % (alias, address, paired, connected, blocked))
                 
                 if paired and connected and not blocked and address:
+                    print("[DEBUG] Using BlueZ fallback device: %s" % address)
                     return address
-        except dbus.exceptions.DBusException:
+        except dbus.exceptions.DBusException as exc:
+            print("[DEBUG] BlueZ scan failed: %s" % exc)
             pass
         
+        print("[DEBUG] NO device found!")
         return None
 
     def _dial_candidates(self, normalized_number):
@@ -781,7 +794,9 @@ class PhoneManager(object):
         """
         Method to place call. It handles incorrectly dialed numbers thanks to ofono exceptions
         """
+        print("[DEBUG] call() invoked: number=%s, available=%s, voice_call_manager=%s" % (number, self.available, self.voice_call_manager is not None))
         if not self.available or self.voice_call_manager is None:
+            print("[DEBUG] Call system not available (available=%s, mgr=%s)" % (self.available, self.voice_call_manager))
             print("Call system not available")
             self.audio_player.play(self._asset_path("not_connected.wav"))
             return
@@ -814,7 +829,12 @@ class PhoneManager(object):
             self.audio_player.play(self._asset_path("format_incorrect.wav"))
         except dbus.exceptions.DBusException as e:
             name = e.get_dbus_name()
+            print("[DEBUG] oFono call exception: %s" % name)
+            print("[DEBUG] Full exception: %s" % str(e))
+            print("[DEBUG] modem_path: %s" % self.modem_path)
+            print("[DEBUG] bt_device_path: %s" % self.bt_device_path)
             if name == 'org.freedesktop.DBus.Error.UnknownMethod':
+                print("[DEBUG] UnknownMethod - HFP likely not established. modem=%s" % self.modem_path)
                 print("Ofono not running")
                 self.audio_player.play(self._asset_path("not_connected.wav"))
             else:
@@ -883,11 +903,12 @@ class Telephone(object):
         self.number_q = queue.Queue()
         self.audio_player = AudioPlayer()
         self.phone_manager = PhoneManager(self.audio_player, self.asset_dir)
+        print("[BT] ***INIT*** Querying initial device...")
         modem_bt_device = self.phone_manager.get_bt_device_address()
         if modem_bt_device:
-            print("[BT] Using modem Bluetooth device %s" % modem_bt_device)
+            print("[BT] ***INIT*** Using Bluetooth device %s" % modem_bt_device)
         else:
-            print("[BT] No modem Bluetooth device found yet")
+            print("[BT] ***INIT*** No connected paired Bluetooth device found yet")
         self.uplink_bridge = UplinkBridge(bt_device=modem_bt_device, capture_device='plughw:Device,0')
         self.downlink_bridge = DownlinkBridge(
             bt_device=modem_bt_device,
@@ -964,13 +985,23 @@ class Telephone(object):
         self.uplink_bridge.start()
 
     def _refresh_bridge_bt_device(self):
+        """Refresh bridge device before starting a call.
+        
+        This ensures we use the currently connected device, not oFono's
+        cached device from initialization. Critical when switching between
+        multiple paired phones.
+        """
+        print("[BT] _refresh_bridge_bt_device() called")
         modem_bt_device = self.phone_manager.get_bt_device_address()
+        print("[BT] Device query returned: %s" % modem_bt_device)
         if not modem_bt_device:
-            print("[BT] Cannot refresh bridge device: modem device not available")
+            print("[BT] Cannot refresh bridge device: no connected paired device available")
             return False
         self.uplink_bridge.set_bt_device(modem_bt_device)
         self.downlink_bridge.set_bt_device(modem_bt_device)
-        print("[BT] Bridge device set to %s" % modem_bt_device)
+        print("[BT] Bridges updated to device: %s" % modem_bt_device)
+        print("[BT] Uplink playback_device: %s" % self.uplink_bridge.playback_device)
+        print("[BT] Downlink capture_device: %s" % self.downlink_bridge.capture_device)
         return True
 
     def _on_call_started(self):
@@ -981,6 +1012,7 @@ class Telephone(object):
         point causes arecord to buffer audio data against a not-yet-active SCO
         channel, resulting in several seconds of delay at call start.
         """
+        print("[CALL] ***_on_call_started() invoked***")
         self._refresh_bridge_bt_device()
         self._disable_wifi_for_call()
         self.downlink_bridge.start()
